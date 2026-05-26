@@ -1,6 +1,6 @@
 .{
     .name = .one_cap,
-    .version = "27.05.26",
+    .version = "27.5.26",
     .fingerprint = 0x76a234321fafa634,
     .minimum_zig_version = "0.14.1",
     .paths = .{
