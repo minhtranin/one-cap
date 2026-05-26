@@ -85,6 +85,8 @@ pub fn main() !void {
             opts.audio_source = .monitor;
         } else if (std.mem.eql(u8, a, "--mic")) {
             opts.audio_source = .microphone;
+        } else if (std.mem.eql(u8, a, "--no-ui")) {
+            opts.show_ui = false;
         } else if (a.len > 0 and a[0] == '-') {
             std.log.err("unknown flag: {s}", .{a});
             return error.UnknownFlag;

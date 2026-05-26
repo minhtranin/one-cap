@@ -116,7 +116,7 @@ jobs:
           export XDG_SESSION_DESKTOP=sway
 
           timeout --signal=KILL 30 \
-            ./zig-out/bin/one-cap -d 5 /tmp/test.mkv > /tmp/out.log 2>&1 || true
+            ./zig-out/bin/one-cap --no-ui -d 5 /tmp/test.mkv > /tmp/out.log 2>&1 || true
 
           echo "================ /tmp/out.log ================"
           cat /tmp/out.log
@@ -207,7 +207,7 @@ jobs:
           # backstop: if GTK init or wlr-screencopy hangs inside the AppImage
           # bundle, kill it instead of stalling the workflow indefinitely.
           timeout --signal=KILL 30 \
-            ./${{ steps.appimage.outputs.path }} -d 3 "$OUT" 2>&1 | tee onecap.log || true
+            ./${{ steps.appimage.outputs.path }} --no-ui -d 3 "$OUT" 2>&1 | tee onecap.log || true
 
           echo "--- ffprobe ---"
           ffprobe -v error -show_streams "$OUT" || true
