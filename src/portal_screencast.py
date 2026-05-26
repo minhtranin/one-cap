@@ -106,11 +106,15 @@ def main():
 
     def launch_pipeline(fd, node_id):
         # Matroska container handles abrupt close better than mp4.
+        # WebM (VP8 + webmmux) by default; H264/Matroska if path ends in .mkv/.mp4.
+        if out_path.endswith(".webm"):
+            enc = "vp8enc deadline=1 cpu-used=8 threads=4 target-bitrate=8000000 ! webmmux streamable=true"
+        else:
+            enc = "x264enc speed-preset=ultrafast tune=zerolatency bitrate=8000 ! matroskamux streamable=true"
         pipeline_str = (
             f"pipewiresrc fd={fd} path={node_id} do-timestamp=true ! "
             f"videoconvert ! videorate ! video/x-raw,framerate={framerate}/1 ! "
-            f"queue ! x264enc speed-preset=ultrafast tune=zerolatency bitrate=8000 ! "
-            f"matroskamux streamable=true ! "
+            f"queue ! {enc} ! "
             f"filesink location={out_path} sync=false"
         )
         pipeline = Gst.parse_launch(pipeline_str)

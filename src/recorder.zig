@@ -19,8 +19,13 @@ pub fn record(allocator: std.mem.Allocator, opts: Options) !void {
 
     // Detect backend first so we can pick a matching intermediate file extension.
     const backend = try screen.detectBackend(allocator);
+
+    // Intermediate file ext follows the desired output container when possible,
+    // so the portal helper writes WebM directly when user asked for WebM (lets
+    // mux stream-copy VP8 instead of re-encoding).
+    const out_is_webm = std.mem.endsWith(u8, opts.output_path, ".webm");
     const tmp_video = switch (backend) {
-        .portal_pipewire => "/tmp/one-cap-video.mkv",
+        .portal_pipewire => if (out_is_webm) "/tmp/one-cap-video.webm" else "/tmp/one-cap-video.mkv",
         else => "/tmp/one-cap-video.mp4",
     };
     std.fs.cwd().deleteFile(tmp_video) catch {};
@@ -76,21 +81,23 @@ fn mux(
     const ch = try std.fmt.allocPrint(allocator, "{d}", .{opts.channels});
     defer allocator.free(ch);
 
-    // Portal+pipewire writes Matroska with H264 — can stream-copy. mp4 sources also copy.
-    const video_codec: []const u8 = "copy";
+    // Stream-copy video always (portal helper picked the right codec for the container).
+    // Audio encoder follows container: webm → Opus, mp4/mkv → AAC.
+    const audio_codec: []const u8 = if (std.mem.endsWith(u8, opts.output_path, ".webm"))
+        "libopus"
+    else
+        "aac";
 
     const argv = [_][]const u8{
-        "ffmpeg",   "-y",
-        "-i",       video_path,
-        "-f",       "s16le",
-        "-ar",      sr,
-        "-ac",      ch,
-        "-i",       audio_path,
-        "-c:v",     video_codec,
-        "-preset",  "veryfast",
-        "-pix_fmt", "yuv420p",
-        "-c:a",     "aac",
-        "-b:a",     "192k",
+        "ffmpeg", "-y",
+        "-i",     video_path,
+        "-f",     "s16le",
+        "-ar",    sr,
+        "-ac",    ch,
+        "-i",     audio_path,
+        "-c:v",   "copy",
+        "-c:a",   audio_codec,
+        "-b:a",   "192k",
         "-shortest",
         opts.output_path,
     };

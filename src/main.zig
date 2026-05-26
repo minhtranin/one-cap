@@ -2,11 +2,17 @@ const std = @import("std");
 const recorder = @import("recorder.zig");
 const audio = @import("audio.zig");
 
+const c = @cImport({
+    @cInclude("time.h");
+});
+
 const usage =
     \\one-cap — simple Wayland screen+audio recorder (Zig)
     \\
     \\USAGE:
-    \\    one-cap <output.mp4> [options]
+    \\    one-cap [output-file] [options]
+    \\
+    \\If output-file is omitted, it defaults to ~/Videos/onecap-<timestamp>.webm
     \\
     \\OPTIONS:
     \\    -d, --duration <secs>   Record for N seconds (default: until Ctrl+C)
@@ -15,8 +21,9 @@ const usage =
     \\    -h, --help              Print this help
     \\
     \\EXAMPLES:
-    \\    one-cap out.mp4 -d 10
-    \\    one-cap demo.mp4 --monitor
+    \\    one-cap                          # → ~/Videos/onecap-20260526-173025.webm
+    \\    one-cap demo.mp4 -d 10
+    \\    one-cap clip.webm --monitor
     \\
 ;
 
@@ -27,11 +34,6 @@ pub fn main() !void {
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
-
-    if (args.len < 2) {
-        try std.io.getStdErr().writer().writeAll(usage);
-        return error.MissingArgs;
-    }
 
     var opts = recorder.Options{
         .output_path = "",
@@ -66,13 +68,39 @@ pub fn main() !void {
         }
     }
 
-    if (positional == null) {
-        try std.io.getStdErr().writer().writeAll(usage);
-        return error.MissingOutput;
+    var default_path_buf: ?[]u8 = null;
+    defer if (default_path_buf) |b| allocator.free(b);
+
+    if (positional) |p| {
+        opts.output_path = p;
+    } else {
+        default_path_buf = try defaultOutputPath(allocator);
+        opts.output_path = default_path_buf.?;
     }
-    opts.output_path = positional.?;
 
     try recorder.record(allocator, opts);
+}
+
+/// ~/Videos/onecap-YYYYMMDD-HHMMSS.webm — creates ~/Videos if missing.
+fn defaultOutputPath(allocator: std.mem.Allocator) ![]u8 {
+    const home = std.posix.getenv("HOME") orelse return error.NoHomeEnv;
+    const dir = try std.fmt.allocPrint(allocator, "{s}/Videos", .{home});
+    defer allocator.free(dir);
+    std.fs.cwd().makePath(dir) catch {};
+
+    var raw: c.time_t = c.time(null);
+    var tm: c.struct_tm = undefined;
+    _ = c.localtime_r(&raw, &tm);
+
+    return std.fmt.allocPrint(allocator, "{s}/onecap-{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}.webm", .{
+        dir,
+        @as(u32, @intCast(tm.tm_year + 1900)),
+        @as(u32, @intCast(tm.tm_mon + 1)),
+        @as(u32, @intCast(tm.tm_mday)),
+        @as(u32, @intCast(tm.tm_hour)),
+        @as(u32, @intCast(tm.tm_min)),
+        @as(u32, @intCast(tm.tm_sec)),
+    });
 }
 
 test "compile audio module" {
