@@ -23,11 +23,14 @@ mkdir -p "$APPDIR/usr/bin"
 
 cp "$BIN" "$APPDIR/usr/bin/one-cap"
 
-# ffmpeg is a runtime dep. We bundle it so AppImage works on hosts that don't
-# have ffmpeg installed. linuxdeploy will pick up its libs.
-if command -v ffmpeg >/dev/null; then
-    cp "$(command -v ffmpeg)" "$APPDIR/usr/bin/ffmpeg"
-fi
+# NOTE: ffmpeg is a runtime dep, but bundling it pulls in 60+ transitive
+# shared libs (libplacebo, libass, libva, libvpl, libmysofa, libflite_*,
+# libopenmpt, ...) ballooning the AppImage to ~150MB and slowing builds
+# by an order of magnitude. one-cap shells out to `ffmpeg` from $PATH, so
+# we require the host to have it installed instead — same expectation
+# every screen recorder on Linux makes. AppRun adds a friendly error.
+# To bundle anyway: copy a static ffmpeg into $APPDIR/usr/bin/ffmpeg and
+# DELETE the libs that linuxdeploy then drags in.
 
 # linuxdeploy assembles the AppDir with the binary as its entry point,
 # discovers needed shared libs (libpulse, libwayland-client, libgtk-3, ...)
