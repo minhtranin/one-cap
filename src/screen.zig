@@ -1,21 +1,22 @@
-//! Screen capture for Wayland.
+//! Screen capture.
 //! Strategy per compositor:
-//!   GNOME           → org.gnome.Shell.Screencast DBus (writes WebM)
-//!   wlroots         → wf-recorder subprocess
-//!   XWayland-only   → ffmpeg x11grab (NOTE: on GNOME this captures black)
-//!   Fallback        → ffmpeg kmsgrab (needs CAP_SYS_ADMIN)
+//!   wlr-screencopy  → in-process Zig (libwayland) + ffmpeg stdin (niri/sway/Hyprland/wayfire/river/KDE)
+//!   wf-recorder     → wlroots CLI fallback
+//!   ffmpeg x11grab  → XWayland
+//!   ffmpeg kmsgrab  → DRM, needs CAP_SYS_ADMIN
 
 const std = @import("std");
+const screencopy_backend = @import("screencopy_backend.zig");
 
 pub const Backend = enum {
-    portal_pipewire, // xdg-desktop-portal ScreenCast + GStreamer (works on GNOME/KDE Wayland)
-    wf_recorder, // wlroots compositors
-    ffmpeg_x11grab, // XWayland — NOTE: produces black on GNOME Wayland
-    ffmpeg_kmsgrab, // any DRM, needs CAP_SYS_ADMIN
+    wlr_screencopy,
+    wf_recorder,
+    ffmpeg_x11grab,
+    ffmpeg_kmsgrab,
 
     pub fn label(self: Backend) []const u8 {
         return switch (self) {
-            .portal_pipewire => "portal+pipewire",
+            .wlr_screencopy => "wlr-screencopy(zig)",
             .wf_recorder => "wf-recorder",
             .ffmpeg_x11grab => "ffmpeg+x11grab",
             .ffmpeg_kmsgrab => "ffmpeg+kmsgrab",
@@ -24,14 +25,14 @@ pub const Backend = enum {
 
     pub fn extension(self: Backend) []const u8 {
         return switch (self) {
-            .portal_pipewire => "mkv",
+            .wlr_screencopy => "mkv",
             else => "mp4",
         };
     }
 };
 
 pub const Config = struct {
-    output_path: []const u8, // path the backend writes to (intermediate, before mux)
+    output_path: []const u8,
     framerate: u32 = 30,
     video_bitrate_kbps: u32 = 20000,
     display: []const u8 = ":0.0",
@@ -40,54 +41,78 @@ pub const Config = struct {
 
 pub const Recorder = struct {
     allocator: std.mem.Allocator,
-    child: std.process.Child,
     backend: Backend,
+    impl: Impl,
+
+    const Impl = union(enum) {
+        subprocess: std.process.Child,
+        screencopy: screencopy_backend.Backend,
+    };
 
     pub fn start(allocator: std.mem.Allocator, cfg: Config) !Recorder {
         const backend = cfg.backend orelse try detectBackend(allocator);
         std.log.info("screen capture backend: {s} → {s}", .{ backend.label(), cfg.output_path });
+
+        if (backend == .wlr_screencopy) {
+            const sc = try screencopy_backend.Backend.start(allocator, .{
+                .output_path = cfg.output_path,
+                .framerate = cfg.framerate,
+                .video_bitrate_kbps = cfg.video_bitrate_kbps,
+            });
+            return .{ .allocator = allocator, .backend = backend, .impl = .{ .screencopy = sc } };
+        }
 
         var argv = try buildArgv(allocator, backend, cfg);
         defer freeArgv(allocator, &argv);
 
         var child = std.process.Child.init(argv.items, allocator);
         child.stdin_behavior = .Pipe;
-        child.stdout_behavior = if (backend == .portal_pipewire) .Pipe else .Ignore;
+        child.stdout_behavior = .Ignore;
         child.stderr_behavior = .Inherit;
         try child.spawn();
 
-        // Portal backend prints PORTAL_READY when pipeline is live — wait for it
-        // so caller doesn't start audio before the screen pipeline is recording.
-        if (backend == .portal_pipewire) {
-            try waitForReady(&child);
-        }
-
-        return .{ .allocator = allocator, .child = child, .backend = backend };
+        return .{ .allocator = allocator, .backend = backend, .impl = .{ .subprocess = child } };
     }
 
     pub fn stop(self: *Recorder) !void {
-        if (self.child.stdin) |stdin| {
-            // Tell the portal helper to finalize the pipeline cleanly. It
-            // listens on stdin for PAUSE/RESUME/STOP.
-            _ = stdin.writeAll("STOP\n") catch {};
-            stdin.close();
-            self.child.stdin = null;
+        switch (self.impl) {
+            .screencopy => |*sc| sc.stop(),
+            .subprocess => |*child| {
+                if (child.stdin) |stdin| {
+                    stdin.close();
+                    child.stdin = null;
+                }
+                _ = child.wait() catch {};
+            },
         }
-        // Helper exits on its own after handling STOP; SIGINT as backstop only
-        // if it stalls.
-        _ = self.child.wait() catch {};
     }
 
-    /// Forwards a line (with trailing newline) to the screen child's stdin.
-    /// Only meaningful for the portal_pipewire backend currently.
+    /// For wlr_screencopy: routes PAUSE/RESUME lines to the in-process capture.
+    /// For subprocess backends this is a no-op (no command channel).
     pub fn sendCommand(self: *Recorder, line: []const u8) !void {
-        if (self.backend != .portal_pipewire) return; // other backends ignore
-        const stdin = self.child.stdin orelse return error.NoStdin;
-        try stdin.writeAll(line);
+        switch (self.impl) {
+            .screencopy => |*sc| {
+                if (std.mem.startsWith(u8, line, "PAUSE")) sc.setPaused(true)
+                else if (std.mem.startsWith(u8, line, "RESUME")) sc.setPaused(false);
+            },
+            .subprocess => {},
+        }
+    }
+
+    pub fn setShowCursor(self: *Recorder, v: bool) void {
+        switch (self.impl) {
+            .screencopy => |*sc| sc.setShowCursor(v),
+            .subprocess => {},
+        }
     }
 
     pub fn deinit(self: *Recorder) void {
-        _ = self.child.kill() catch {};
+        switch (self.impl) {
+            .screencopy => |*sc| sc.deinit(),
+            .subprocess => |*child| {
+                _ = child.kill() catch {};
+            },
+        }
     }
 
     pub fn backendUsed(self: Recorder) Backend {
@@ -95,25 +120,12 @@ pub const Recorder = struct {
     }
 };
 
-fn waitForReady(child: *std.process.Child) !void {
-    const stdout = child.stdout orelse return error.NoStdout;
-    var buf: [128]u8 = undefined;
-    var total: usize = 0;
-    while (total < buf.len) {
-        const n = stdout.read(buf[total..]) catch return error.PortalReadyFailed;
-        if (n == 0) return error.PortalHelperExited;
-        total += n;
-        if (std.mem.indexOf(u8, buf[0..total], "PORTAL_READY")) |_| return;
-    }
-    return error.PortalHelperNoReady;
-}
-
 // --- detection ---
 
 pub fn detectBackend(allocator: std.mem.Allocator) !Backend {
     const wayland = std.posix.getenv("WAYLAND_DISPLAY");
-    if (wayland != null and wayland.?.len > 0 and hasBin(allocator, "python3")) {
-        return .portal_pipewire;
+    if (wayland != null and wayland.?.len > 0 and hasBin(allocator, "ffmpeg")) {
+        return .wlr_screencopy;
     }
     if (isWlrootsCompositor() and hasBin(allocator, "wf-recorder")) return .wf_recorder;
     const display = std.posix.getenv("DISPLAY");
@@ -125,7 +137,7 @@ pub fn detectBackend(allocator: std.mem.Allocator) !Backend {
 fn isWlrootsCompositor() bool {
     const desktop = std.posix.getenv("XDG_CURRENT_DESKTOP") orelse "";
     const session = std.posix.getenv("XDG_SESSION_DESKTOP") orelse "";
-    const wlroots = [_][]const u8{ "sway", "Sway", "Hyprland", "hyprland", "wayfire", "Wayfire", "river", "River" };
+    const wlroots = [_][]const u8{ "sway", "Sway", "Hyprland", "hyprland", "wayfire", "Wayfire", "river", "River", "niri", "Niri" };
     for (wlroots) |name| {
         if (std.mem.indexOf(u8, desktop, name) != null) return true;
         if (std.mem.indexOf(u8, session, name) != null) return true;
@@ -160,15 +172,7 @@ fn buildArgv(
     const display = try allocator.dupe(u8, cfg.display);
 
     switch (backend) {
-        .portal_pipewire => {
-            const script = try findPortalHelper(allocator);
-            try list.append(try allocator.dupe(u8, "python3"));
-            try list.append(script);
-            try list.append(path);
-            try list.append(fr);
-            try list.append(br);
-            allocator.free(display);
-        },
+        .wlr_screencopy => unreachable, // handled in Recorder.start before this
         .wf_recorder => {
             try list.append(try allocator.dupe(u8, "wf-recorder"));
             try list.append(try allocator.dupe(u8, "-f"));
@@ -231,23 +235,4 @@ fn buildArgv(
 fn freeArgv(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8)) void {
     for (list.items) |s| allocator.free(s);
     list.deinit();
-}
-
-/// Locate portal_screencast.py: env override, then sibling of executable, then dev path.
-fn findPortalHelper(allocator: std.mem.Allocator) ![]const u8 {
-    if (std.posix.getenv("ONECAP_PORTAL_HELPER")) |env_path| {
-        return allocator.dupe(u8, env_path);
-    }
-
-    const candidates = [_][]const u8{
-        "/home/tcm/workspace/personal/one-cap/src/portal_screencast.py",
-        "./src/portal_screencast.py",
-        "/usr/local/share/one-cap/portal_screencast.py",
-        "/usr/share/one-cap/portal_screencast.py",
-    };
-    for (candidates) |p| {
-        std.fs.cwd().access(p, .{}) catch continue;
-        return allocator.dupe(u8, p);
-    }
-    return error.PortalHelperNotFound;
 }

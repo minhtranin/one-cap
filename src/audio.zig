@@ -118,10 +118,18 @@ pub const Capture = struct {
 };
 
 /// Thread entrypoint: capture until stop flag, write all bytes to writer.
+/// While paused we drain pulse (so its ring buffer doesn't back up) and
+/// write equivalent silence to the output file. Writing silence keeps the
+/// file's time axis aligned with wall clock — required when this stream is
+/// later muxed with another audio track (e.g. mic-on-top-of-system-audio).
+/// Without it, toggling pause/unpause produces a track that's shorter than
+/// real elapsed time and ffmpeg amix plays it from t=0, producing audio
+/// drift equal to the total paused duration.
 pub fn captureLoop(cap: *Capture, file: std.fs.File) void {
     const bytes_per_chunk = (cap.cfg.sample_rate * @as(u32, cap.cfg.channels) * 2 * cap.cfg.fragment_ms) / 1000;
     var buf: [16384]u8 = undefined;
     const chunk = if (bytes_per_chunk > buf.len) buf.len else bytes_per_chunk;
+    var silence: [16384]u8 = [_]u8{0} ** 16384;
 
     while (cap.isRunning()) {
         cap.readBytes(buf[0..chunk]) catch |e| {
@@ -129,11 +137,8 @@ pub fn captureLoop(cap: *Capture, file: std.fs.File) void {
             std.log.err("audio loop error: {}", .{e});
             break;
         };
-        // While paused, we still drain pulse so its ring buffer doesn't back up,
-        // but we drop the samples instead of writing — keeps audio timeline in
-        // sync with the video, which is also paused by GStreamer.
-        if (cap.isPaused()) continue;
-        _ = file.writeAll(buf[0..chunk]) catch |e| {
+        const payload = if (cap.isPaused()) silence[0..chunk] else buf[0..chunk];
+        _ = file.writeAll(payload) catch |e| {
             std.log.err("audio file write failed: {}", .{e});
             break;
         };
