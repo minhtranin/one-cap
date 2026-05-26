@@ -28,7 +28,7 @@ pub fn record(allocator: std.mem.Allocator, opts: Options) !void {
 
     const backend = try screen.detectBackend(allocator);
     const tmp_video = switch (backend) {
-        .wlr_screencopy => "/tmp/one-cap-video.mkv",
+        .wlr_screencopy, .portal_pipewire => "/tmp/one-cap-video.mkv",
         else => "/tmp/one-cap-video.mp4",
     };
     std.fs.cwd().deleteFile(tmp_video) catch {};

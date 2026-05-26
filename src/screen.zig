@@ -9,7 +9,8 @@ const std = @import("std");
 const screencopy_backend = @import("screencopy_backend.zig");
 
 pub const Backend = enum {
-    wlr_screencopy,
+    wlr_screencopy,    // in-process Zig + libwayland (wlroots, niri, KDE)
+    portal_pipewire,   // Python helper does DBus + GStreamer (GNOME/Ubuntu)
     wf_recorder,
     ffmpeg_x11grab,
     ffmpeg_kmsgrab,
@@ -17,6 +18,7 @@ pub const Backend = enum {
     pub fn label(self: Backend) []const u8 {
         return switch (self) {
             .wlr_screencopy => "wlr-screencopy(zig)",
+            .portal_pipewire => "xdg-portal+gstreamer(python)",
             .wf_recorder => "wf-recorder",
             .ffmpeg_x11grab => "ffmpeg+x11grab",
             .ffmpeg_kmsgrab => "ffmpeg+kmsgrab",
@@ -25,7 +27,7 @@ pub const Backend = enum {
 
     pub fn extension(self: Backend) []const u8 {
         return switch (self) {
-            .wlr_screencopy => "mkv",
+            .wlr_screencopy, .portal_pipewire => "mkv",
             else => "mp4",
         };
     }
@@ -67,9 +69,16 @@ pub const Recorder = struct {
 
         var child = std.process.Child.init(argv.items, allocator);
         child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Ignore;
+        // Portal helper prints PORTAL_READY to stdout after the user clicks
+        // Share; we need to read it to know capture has started. Other
+        // subprocess backends don't have a readiness handshake.
+        child.stdout_behavior = if (backend == .portal_pipewire) .Pipe else .Ignore;
         child.stderr_behavior = .Inherit;
         try child.spawn();
+
+        if (backend == .portal_pipewire) {
+            try waitForReady(&child);
+        }
 
         return .{ .allocator = allocator, .backend = backend, .impl = .{ .subprocess = child } };
     }
@@ -79,6 +88,11 @@ pub const Recorder = struct {
             .screencopy => |*sc| sc.stop(),
             .subprocess => |*child| {
                 if (child.stdin) |stdin| {
+                    // Portal helper listens on stdin for STOP; for other
+                    // backends this is harmless extra data we then close.
+                    if (self.backend == .portal_pipewire) {
+                        _ = stdin.writeAll("STOP\n") catch {};
+                    }
                     stdin.close();
                     child.stdin = null;
                 }
@@ -87,15 +101,18 @@ pub const Recorder = struct {
         }
     }
 
-    /// For wlr_screencopy: routes PAUSE/RESUME lines to the in-process capture.
-    /// For subprocess backends this is a no-op (no command channel).
     pub fn sendCommand(self: *Recorder, line: []const u8) !void {
         switch (self.impl) {
             .screencopy => |*sc| {
                 if (std.mem.startsWith(u8, line, "PAUSE")) sc.setPaused(true)
                 else if (std.mem.startsWith(u8, line, "RESUME")) sc.setPaused(false);
             },
-            .subprocess => {},
+            .subprocess => |*child| {
+                // Only the portal helper has a stdin command channel.
+                if (self.backend != .portal_pipewire) return;
+                const stdin = child.stdin orelse return error.NoStdin;
+                try stdin.writeAll(line);
+            },
         }
     }
 
@@ -120,18 +137,52 @@ pub const Recorder = struct {
     }
 };
 
+/// Reads the portal helper's stdout until the PORTAL_READY marker arrives —
+/// that's the signal the GStreamer pipeline has gone PLAYING and frames are
+/// flowing. Callers must wait for this before starting audio so the two
+/// streams' clocks line up.
+fn waitForReady(child: *std.process.Child) !void {
+    const stdout = child.stdout orelse return error.NoStdout;
+    var buf: [256]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = stdout.read(buf[total..]) catch return error.PortalReadyFailed;
+        if (n == 0) return error.PortalHelperExited;
+        total += n;
+        if (std.mem.indexOf(u8, buf[0..total], "PORTAL_READY")) |_| return;
+    }
+    return error.PortalHelperNoReady;
+}
+
 // --- detection ---
 
 pub fn detectBackend(allocator: std.mem.Allocator) !Backend {
     const wayland = std.posix.getenv("WAYLAND_DISPLAY");
-    if (wayland != null and wayland.?.len > 0 and hasBin(allocator, "ffmpeg")) {
-        return .wlr_screencopy;
+    if (wayland != null and wayland.?.len > 0) {
+        // GNOME / Ubuntu Wayland: no wlr-screencopy global. Use the Python
+        // portal helper (xdg-desktop-portal ScreenCast + GStreamer).
+        if (isGnomeCompositor() and hasBin(allocator, "python3") and hasBin(allocator, "ffmpeg"))
+            return .portal_pipewire;
+        // wlroots-style compositors (niri/sway/Hyprland/KDE on wlroots) →
+        // fast in-process libwayland capture.
+        if (hasBin(allocator, "ffmpeg")) return .wlr_screencopy;
     }
     if (isWlrootsCompositor() and hasBin(allocator, "wf-recorder")) return .wf_recorder;
     const display = std.posix.getenv("DISPLAY");
     if (display != null and display.?.len > 0 and hasBin(allocator, "ffmpeg")) return .ffmpeg_x11grab;
     if (hasBin(allocator, "ffmpeg")) return .ffmpeg_kmsgrab;
     return error.NoBackendAvailable;
+}
+
+fn isGnomeCompositor() bool {
+    const desktop = std.posix.getenv("XDG_CURRENT_DESKTOP") orelse "";
+    const session = std.posix.getenv("XDG_SESSION_DESKTOP") orelse "";
+    const gnome_names = [_][]const u8{ "GNOME", "gnome", "Unity", "ubuntu" };
+    for (gnome_names) |name| {
+        if (std.mem.indexOf(u8, desktop, name) != null) return true;
+        if (std.mem.indexOf(u8, session, name) != null) return true;
+    }
+    return false;
 }
 
 fn isWlrootsCompositor() bool {
@@ -173,6 +224,15 @@ fn buildArgv(
 
     switch (backend) {
         .wlr_screencopy => unreachable, // handled in Recorder.start before this
+        .portal_pipewire => {
+            const script = try findPortalHelper(allocator);
+            try list.append(try allocator.dupe(u8, "python3"));
+            try list.append(script);
+            try list.append(path);
+            try list.append(fr);
+            try list.append(br);
+            allocator.free(display);
+        },
         .wf_recorder => {
             try list.append(try allocator.dupe(u8, "wf-recorder"));
             try list.append(try allocator.dupe(u8, "-f"));
@@ -235,4 +295,45 @@ fn buildArgv(
 fn freeArgv(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8)) void {
     for (list.items) |s| allocator.free(s);
     list.deinit();
+}
+
+/// Locate portal_screencast.py at runtime. Order:
+///   1. $ONECAP_PORTAL_HELPER env override
+///   2. Sibling of the running executable (AppImage layout: bin/one-cap →
+///      same dir's portal_screencast.py)
+///   3. Hard-coded source-tree path (for `zig build run` from the repo)
+///   4. System install paths
+fn findPortalHelper(allocator: std.mem.Allocator) ![]const u8 {
+    if (std.posix.getenv("ONECAP_PORTAL_HELPER")) |env_path| {
+        return allocator.dupe(u8, env_path);
+    }
+    // Resolve sibling of the running binary.
+    var self_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (std.fs.selfExeDirPath(&self_buf)) |dir| {
+        const sibling = try std.fmt.allocPrint(allocator, "{s}/portal_screencast.py", .{dir});
+        if (std.fs.cwd().access(sibling, .{})) |_| {
+            return sibling;
+        } else |_| {
+            allocator.free(sibling);
+        }
+        // AppImage installs scripts under ../share/one-cap/
+        const share = try std.fmt.allocPrint(allocator, "{s}/../share/one-cap/portal_screencast.py", .{dir});
+        if (std.fs.cwd().access(share, .{})) |_| {
+            return share;
+        } else |_| {
+            allocator.free(share);
+        }
+    } else |_| {}
+
+    const candidates = [_][]const u8{
+        "/home/tcm/workspace/personal/one-cap/src/portal_screencast.py",
+        "./src/portal_screencast.py",
+        "/usr/local/share/one-cap/portal_screencast.py",
+        "/usr/share/one-cap/portal_screencast.py",
+    };
+    for (candidates) |p| {
+        std.fs.cwd().access(p, .{}) catch continue;
+        return allocator.dupe(u8, p);
+    }
+    return error.PortalHelperNotFound;
 }
