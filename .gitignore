@@ -4,3 +4,7 @@ zig-out/
 *.raw
 *.mp4
 *.wav
+
+# AppImage build artifacts
+AppDir/
+*.AppImage

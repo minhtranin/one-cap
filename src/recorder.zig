@@ -88,8 +88,25 @@ pub fn record(allocator: std.mem.Allocator, opts: Options) !void {
             &state, &screen_rec, &audio_cap, if (mic_cap != null) &mic_cap.? else null,
         });
 
-        ui.run(&state) catch |e| std.log.err("ui error: {}", .{e});
-        // UI exited (user clicked Stop, closed window, or duration elapsed).
+        var ui_failed = false;
+        ui.run(&state) catch |e| {
+            std.log.err("ui error: {} — falling back to headless duration/SIGINT", .{e});
+            ui_failed = true;
+        };
+
+        if (ui_failed) {
+            // GTK couldn't init (e.g. no DISPLAY in CI / SSH session). Honor
+            // the requested duration headlessly so the recording still finishes
+            // instead of running forever.
+            if (opts.duration_seconds) |secs| {
+                std.time.sleep(@as(u64, secs) * std.time.ns_per_s);
+            } else {
+                waitForInterrupt() catch {};
+            }
+            state.requestStop();
+        }
+        // UI exited (user clicked Stop, closed window, duration elapsed, or
+        // headless fallback above completed).
         ctrl.join();
     } else {
         // Headless path: same lifecycle, no UI thread.

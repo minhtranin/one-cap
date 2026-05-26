@@ -77,8 +77,8 @@ pub fn run(state: *State) !void {
 
     // CSS: strip GTK button padding so the icon-only buttons stay tiny.
     const css =
-        \\button { padding: 4px 10px; min-height: 0px; min-width: 0px; font-size: 13px; }
-        \\label { font-size: 12px; }
+        \\button { padding: 2px 6px; min-height: 0px; min-width: 0px; font-size: 12px; }
+        \\label { font-size: 11px; }
     ;
     const provider = c.gtk_css_provider_new();
     _ = c.gtk_css_provider_load_from_data(provider, css, css.len, null);
@@ -90,7 +90,7 @@ pub fn run(state: *State) !void {
 
     const win = c.gtk_window_new(c.GTK_WINDOW_TOPLEVEL) orelse return error.WindowCreateFailed;
     c.gtk_window_set_title(@ptrCast(win), "one-cap");
-    c.gtk_window_set_default_size(@ptrCast(win), 340, 42);
+    c.gtk_window_set_default_size(@ptrCast(win), 280, 35);
     c.gtk_window_set_keep_above(@ptrCast(win), 1);
     c.gtk_window_set_resizable(@ptrCast(win), 0);
     c.gtk_window_set_decorated(@ptrCast(win), 0);
@@ -102,11 +102,11 @@ pub fn run(state: *State) !void {
     c.gtk_window_set_gravity(@ptrCast(win), c.GDK_GRAVITY_NORTH_EAST);
     c.gtk_window_move(@ptrCast(win), 10, 10);
 
-    const box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 3);
+    const box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 5);
     c.gtk_widget_set_margin_top(box, 2);
     c.gtk_widget_set_margin_bottom(box, 2);
-    c.gtk_widget_set_margin_start(box, 5);
-    c.gtk_widget_set_margin_end(box, 5);
+    c.gtk_widget_set_margin_start(box, 8);
+    c.gtk_widget_set_margin_end(box, 8);
     c.gtk_container_add(@ptrCast(win), box);
 
     // Drag handle: an EventBox wraps the brand+status labels. Pressing on
@@ -139,10 +139,10 @@ pub fn run(state: *State) !void {
     const mic_btn = c.gtk_button_new_with_label("🎤");
     const pause_btn = c.gtk_button_new_with_label("⏸");
     const stop_btn = c.gtk_button_new_with_label("⏹");
-    c.gtk_widget_set_size_request(cursor_btn, 36, 28);
-    c.gtk_widget_set_size_request(mic_btn, 36, 28);
-    c.gtk_widget_set_size_request(pause_btn, 36, 28);
-    c.gtk_widget_set_size_request(stop_btn, 36, 28);
+    c.gtk_widget_set_size_request(cursor_btn, 30, 24);
+    c.gtk_widget_set_size_request(mic_btn, 30, 24);
+    c.gtk_widget_set_size_request(pause_btn, 30, 24);
+    c.gtk_widget_set_size_request(stop_btn, 30, 24);
     c.gtk_widget_set_tooltip_text(cursor_btn, "Toggle cursor capture");
     c.gtk_widget_set_tooltip_text(mic_btn, "Toggle microphone");
     c.gtk_button_set_relief(@ptrCast(cursor_btn), c.GTK_RELIEF_NORMAL);
