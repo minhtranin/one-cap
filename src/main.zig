@@ -12,7 +12,8 @@ const usage =
     \\USAGE:
     \\    one-cap [output-file] [options]
     \\
-    \\If output-file is omitted, it defaults to ~/Videos/onecap-<timestamp>.webm
+    \\If output-file is omitted, it defaults to ~/Videos/onecap-<timestamp>.mkv
+    \\(MKV+H264 = much faster encode than .webm/VP8 at 1440p, no frame drops)
     \\
     \\DEFAULTS: system audio (monitor) + ultra quality (40 Mbps)
     \\
@@ -26,10 +27,11 @@ const usage =
     \\    -h, --help              Print this help
     \\
     \\EXAMPLES:
-    \\    one-cap                          # → ~/Videos/onecap-<ts>.webm, system audio, ultra
+    \\    one-cap                          # → ~/Videos/onecap-<ts>.mkv (H264 ultra, sys audio)
     \\    one-cap demo.mp4 -d 10
-    \\    one-cap clip.webm --mic          # mic instead of system audio
-    \\    one-cap clip.webm -q medium      # 15 Mbps
+    \\    one-cap clip.webm                # webm/VP8 (slower, may drop frames at 1440p)
+    \\    one-cap clip.mkv --mic
+    \\    one-cap clip.mkv -q medium       # 15 Mbps
     \\
 ;
 
@@ -116,7 +118,7 @@ fn defaultOutputPath(allocator: std.mem.Allocator) ![]u8 {
     var tm: c.struct_tm = undefined;
     _ = c.localtime_r(&raw, &tm);
 
-    return std.fmt.allocPrint(allocator, "{s}/onecap-{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}.webm", .{
+    return std.fmt.allocPrint(allocator, "{s}/onecap-{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}.mkv", .{
         dir,
         @as(u32, @intCast(tm.tm_year + 1900)),
         @as(u32, @intCast(tm.tm_mon + 1)),

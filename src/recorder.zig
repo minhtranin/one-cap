@@ -21,9 +21,9 @@ pub fn record(allocator: std.mem.Allocator, opts: Options) !void {
     // Detect backend first so we can pick a matching intermediate file extension.
     const backend = try screen.detectBackend(allocator);
 
-    // Intermediate file ext follows the desired output container when possible,
-    // so the portal helper writes WebM directly when user asked for WebM (lets
-    // mux stream-copy VP8 instead of re-encoding).
+    // Intermediate file ext follows the desired output container so the portal
+    // helper picks the matching encoder (VP8 for webm, x264 for mkv/mp4). This
+    // lets the mux step stream-copy video instead of re-encoding.
     const out_is_webm = std.mem.endsWith(u8, opts.output_path, ".webm");
     const tmp_video = switch (backend) {
         .portal_pipewire => if (out_is_webm) "/tmp/one-cap-video.webm" else "/tmp/one-cap-video.mkv",

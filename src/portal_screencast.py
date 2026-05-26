@@ -107,10 +107,9 @@ def main():
 
     def launch_pipeline(fd, node_id):
         # Matroska container handles abrupt close better than mp4.
-        # WebM (VP8 + webmmux) by default; H264/Matroska if path ends in .mkv/.mp4.
-        # Quality knobs:
-        #   VP8: end-usage=vbr, cpu-used=4 (balance), keyframe every ~3s
-        #   H264: preset=veryfast (faster than medium, quality > ultrafast), CRF-ish via bitrate
+        # Container picked by extension:
+        #   .webm → VP8 (sw) — only choice for true WebM, slower
+        #   .mkv  → x264 ultrafast (sw) — much faster, no frame drops at 1440p30
         target_bps = bitrate_kbps * 1000
         if out_path.endswith(".webm"):
             enc = (
@@ -121,15 +120,22 @@ def main():
             )
         else:
             enc = (
-                f"x264enc speed-preset=veryfast tune=zerolatency "
+                f"x264enc speed-preset=ultrafast tune=zerolatency "
                 f"bitrate={bitrate_kbps} key-int-max={framerate * 3} "
+                f"byte-stream=true threads=0 "
                 f"! matroskamux streamable=true"
             )
+        # Big queues with leaky=downstream so pipewiresrc never blocks on the
+        # encoder; if encoder genuinely can't keep up, drops happen at the
+        # queue boundary rather than locking the source.
         pipeline_str = (
             f"pipewiresrc fd={fd} path={node_id} do-timestamp=true ! "
-            f"videoconvert ! videorate ! video/x-raw,framerate={framerate}/1 ! "
-            f"queue ! {enc} ! "
-            f"filesink location={out_path} sync=false"
+            f"queue max-size-buffers=200 max-size-time=0 max-size-bytes=0 leaky=downstream ! "
+            f"videoconvert n-threads=4 ! videorate ! video/x-raw,framerate={framerate}/1 ! "
+            f"queue max-size-buffers=200 max-size-time=0 max-size-bytes=0 leaky=downstream ! "
+            f"{enc} ! "
+            f"queue max-size-buffers=200 max-size-time=0 max-size-bytes=0 ! "
+            f"filesink location={out_path} sync=false async=false"
         )
         pipeline = Gst.parse_launch(pipeline_str)
         state["pipeline"] = pipeline
