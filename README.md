@@ -1,18 +1,21 @@
 # one-cap
 
-Simple Wayland screen + audio recorder, written in Zig.
+Simple Wayland screen + audio recorder, written in Zig. Tiny floating
+control window with Pause / Resume / Stop.
 
-Combines:
-- **Audio**: native libpulse capture (ported from [zigy](../zigy/zig-april-captions/src/pulse.zig))
-- **Screen**: `ffmpeg` / `wf-recorder` subprocess (inspired by [zig-oneshot](../oneshot/zig-oneshot/src/wayland/portal.zig))
-- **Mux**: `ffmpeg` to combine into final mp4
+- **Audio**: native libpulse capture from Zig (ported from
+  [zigy](../zigy/zig-april-captions/src/pulse.zig))
+- **Screen**: `xdg-desktop-portal` ScreenCast → GStreamer
+  `pipewiresrc → encoder → matroskamux` (works on GNOME/KDE Wayland);
+  `wf-recorder` on wlroots; `ffmpeg x11grab/kmsgrab` fallbacks
+- **UI**: GTK3 floating window via Zig cImport
+  ([zig-oneshot](../oneshot/zig-oneshot/src/ui/window.zig) pattern)
+- **Mux**: `ffmpeg` final pass — stream-copy video, encode PCM → AAC/Opus
 
 ## Requirements
 
-System packages:
-
 ```bash
-sudo apt install libpulse-dev ffmpeg \
+sudo apt install libpulse-dev libgtk-3-dev ffmpeg \
     python3-dbus python3-gi gir1.2-gstreamer-1.0 \
     gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
     gstreamer1.0-pipewire gstreamer1.0-x x264
@@ -22,9 +25,8 @@ sudo apt install wf-recorder
 
 Zig 0.13.0.
 
-**Note:** On first run on GNOME/KDE Wayland, a permission dialog appears
-asking which monitor to share. Click **Share** (not Cancel). Subsequent
-runs may reuse the grant for that session.
+**First run on GNOME/KDE Wayland:** a permission dialog appears asking
+which monitor to share. Click **Share** (not Cancel).
 
 ## Build
 
@@ -32,53 +34,90 @@ runs may reuse the grant for that session.
 zig build -Doptimize=ReleaseFast
 ```
 
-Binary lands at `zig-out/bin/one-cap`.
+Binary at `zig-out/bin/one-cap` (~3 MB).
 
 ## Usage
 
+Defaults: system audio (monitor), 40 Mbps (ultra), 30 fps, MKV output to
+`~/Videos/onecap-<timestamp>.mkv`.
+
 ```bash
-# Record 10 seconds, mic + screen
-./zig-out/bin/one-cap out.mp4 -d 10
+# Until Stop button / Ctrl+C → ~/Videos/onecap-<ts>.mkv
+one-cap
 
-# Record until Ctrl+C
-./zig-out/bin/one-cap demo.mp4
+# 10s capture, custom name
+one-cap demo.mkv -d 10
 
-# Capture system audio (instead of mic)
-./zig-out/bin/one-cap demo.mp4 --monitor -d 5
+# Mic instead of system audio
+one-cap clip.mkv --mic
 
-# Custom framerate
-./zig-out/bin/one-cap demo.mp4 -r 60 -d 5
+# Quality presets: low / medium / high / ultra (default)
+one-cap clip.mkv -q medium
+
+# Or explicit bitrate
+one-cap clip.mkv -b 30000     # 30 Mbps
+
+# WebM output (slower VP8 software encode, may drop frames at 1440p)
+one-cap clip.webm
+
+# 60 fps
+one-cap clip.mkv -r 60
 ```
 
-## How it works
+### Control window
 
-1. Spawn screen recorder subprocess → `/tmp/one-cap-video.mp4` (silent)
-2. Start audio capture thread → `/tmp/one-cap-audio.raw` (PCM s16le)
-3. On stop: SIGINT to ffmpeg, join audio thread
-4. Mux: `ffmpeg -i video.mp4 -i audio.raw -c:v copy -c:a aac out.mp4`
+A small always-on-top window appears once recording starts. Shows
+elapsed time. Buttons:
 
-## Backend detection
+- **⏸ Pause / ▶ Resume** — freezes GStreamer pipeline + drops audio
+  samples so the timeline stays in sync
+- **⏹ Stop** — finalize + mux to the output file
 
-Auto-selected at runtime:
+Closing the window = Stop. Compositor decides window position on
+Wayland (`gtk_window_move()` is ignored on Wayland); drag if needed.
 
-| Compositor | Backend used |
-|---|---|
-| GNOME/KDE Wayland (any) | `portal+pipewire` (xdg-desktop-portal + GStreamer) |
-| Sway, Hyprland, Wayfire | `wf-recorder` |
-| X11 sessions | `ffmpeg -f x11grab` |
-| Fallback | `ffmpeg -f kmsgrab` (needs `CAP_SYS_ADMIN`) |
+## Architecture
 
-The portal+pipewire backend spawns `src/portal_screencast.py` which does the
-DBus dance, gets a PipeWire stream from the compositor, and pipes it through
-GStreamer's `pipewiresrc → x264enc → matroskamux` to `/tmp/one-cap-video.mkv`.
+```
+main.zig
+  └─ recorder.zig  ── starts screen child + audio thread + GTK ui
+       ├─ screen.zig       — backend dispatcher (Python helper / wf-recorder / ffmpeg)
+       │    └─ portal_screencast.py
+       ├─ audio.zig        — libpulse capture loop
+       └─ ui.zig           — GTK3 window: status + Pause + Stop
+```
+
+1. Detect backend, pick intermediate file ext (`.mkv` / `.webm`)
+2. Spawn screen helper; wait for `PORTAL_READY` on its stdout
+3. Start audio thread → writes `/tmp/one-cap-audio.raw`
+4. Run GTK main loop (status updates, Pause/Stop buttons)
+5. On exit: stop audio + screen, then ffmpeg mux to final output
+
+## Backend / encoder matrix
+
+| Output | Encoder            | Audio | Backend best fit |
+|--------|--------------------|-------|------------------|
+| `.mkv` | x264 ultrafast (sw)| AAC   | portal/wf/ffmpeg |
+| `.mp4` | x264 ultrafast (sw)| AAC   | portal/wf/ffmpeg |
+| `.webm`| VP8 (sw)           | Opus  | portal           |
+
+Compositor → backend:
+
+| Compositor                | Backend           |
+|---------------------------|-------------------|
+| GNOME/KDE Wayland         | `portal_pipewire` |
+| Sway, Hyprland, Wayfire   | `wf-recorder`     |
+| X11                       | `ffmpeg x11grab`  |
+| Other DRM                 | `ffmpeg kmsgrab` (CAP_SYS_ADMIN) |
 
 ## Layout
 
 ```
 src/
   main.zig               — CLI
-  recorder.zig           — orchestrator
+  recorder.zig           — orchestrator + controller thread
   audio.zig              — libpulse capture (Zig)
-  screen.zig             — backend dispatcher (subprocess wrapper)
+  screen.zig             — backend dispatcher / subprocess wrapper
+  ui.zig                 — GTK3 floating control window
   portal_screencast.py   — xdg-desktop-portal + GStreamer helper
 ```
