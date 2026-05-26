@@ -8,8 +8,8 @@ pub const Options = struct {
     output_path: []const u8,
     duration_seconds: ?u32,
     framerate: u32 = 30,
-    video_bitrate_kbps: u32 = 20000, // 20 Mbps default — good for 1440p
-    audio_source: audio.Source = .microphone,
+    video_bitrate_kbps: u32 = 40000, // 40 Mbps = ultra default
+    audio_source: audio.Source = .monitor, // system audio by default
     sample_rate: u32 = 48000,
     channels: u8 = 2,
 };

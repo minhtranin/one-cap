@@ -14,19 +14,22 @@ const usage =
     \\
     \\If output-file is omitted, it defaults to ~/Videos/onecap-<timestamp>.webm
     \\
+    \\DEFAULTS: system audio (monitor) + ultra quality (40 Mbps)
+    \\
     \\OPTIONS:
     \\    -d, --duration <secs>   Record for N seconds (default: until Ctrl+C)
     \\    -r, --framerate <fps>   Video framerate (default: 30)
-    \\    -b, --bitrate <kbps>    Video bitrate in kbps (default: 20000 = 20 Mbps)
+    \\    -b, --bitrate <kbps>    Video bitrate in kbps (default: 40000 = 40 Mbps)
     \\    -q, --quality <name>    Preset: low (8M) | medium (15M) | high (25M) | ultra (40M)
-    \\        --monitor           Capture system audio output (default: microphone)
+    \\        --mic               Capture microphone instead of system audio
+    \\        --monitor           Capture system audio (default — explicit override)
     \\    -h, --help              Print this help
     \\
     \\EXAMPLES:
-    \\    one-cap                          # → ~/Videos/onecap-20260526-173025.webm
+    \\    one-cap                          # → ~/Videos/onecap-<ts>.webm, system audio, ultra
     \\    one-cap demo.mp4 -d 10
-    \\    one-cap clip.webm -q ultra
-    \\    one-cap clip.webm -b 30000       # 30 Mbps
+    \\    one-cap clip.webm --mic          # mic instead of system audio
+    \\    one-cap clip.webm -q medium      # 15 Mbps
     \\
 ;
 
@@ -41,8 +44,6 @@ pub fn main() !void {
     var opts = recorder.Options{
         .output_path = "",
         .duration_seconds = null,
-        .framerate = 30,
-        .audio_source = .microphone,
     };
 
     var positional: ?[]const u8 = null;
@@ -80,6 +81,8 @@ pub fn main() !void {
                 return error.UnknownQualityPreset;
         } else if (std.mem.eql(u8, a, "--monitor")) {
             opts.audio_source = .monitor;
+        } else if (std.mem.eql(u8, a, "--mic")) {
+            opts.audio_source = .microphone;
         } else if (a.len > 0 and a[0] == '-') {
             std.log.err("unknown flag: {s}", .{a});
             return error.UnknownFlag;
