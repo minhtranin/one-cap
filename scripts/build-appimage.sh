@@ -23,6 +23,12 @@ mkdir -p "$APPDIR/usr/bin"
 
 cp "$BIN" "$APPDIR/usr/bin/one-cap"
 
+# Bundle the GNOME/portal screen-capture helper next to the binary.
+# screen.zig's findPortalHelper() looks for a sibling portal_screencast.py
+# first, so this path resolves before any system fallback.
+cp src/portal_screencast.py "$APPDIR/usr/bin/portal_screencast.py"
+chmod +x "$APPDIR/usr/bin/portal_screencast.py"
+
 # NOTE: ffmpeg is a runtime dep, but bundling it pulls in 60+ transitive
 # shared libs (libplacebo, libass, libva, libvpl, libmysofa, libflite_*,
 # libopenmpt, ...) ballooning the AppImage to ~150MB and slowing builds

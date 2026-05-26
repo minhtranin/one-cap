@@ -14,18 +14,27 @@ curl -fsSL https://raw.githubusercontent.com/minhtranin/one-cap/main/install.sh 
 Drops a portable AppImage in `~/.local/bin/one-cap` and registers a desktop
 entry + icon, so `one-cap` shows up in your app launcher. No sudo.
 
-Runtime deps (most distros already have these):
+Runtime deps:
 
 ```bash
-# Arch
+# Arch (wlroots: niri/sway/Hyprland/KDE)
 sudo pacman -S ffmpeg libpulse gtk3
-# Ubuntu / Debian
-sudo apt install ffmpeg libpulse0 libgtk-3-0
+# Arch (GNOME — adds the portal helper deps)
+sudo pacman -S ffmpeg libpulse gtk3 python python-dbus python-gobject \
+  gst-plugins-good gst-plugin-pipewire gst-plugins-ugly
+
+# Ubuntu / Debian (works for both compositor families)
+sudo apt install ffmpeg libpulse0 libgtk-3-0 \
+  python3 python3-dbus python3-gi gir1.2-gstreamer-1.0 \
+  gstreamer1.0-plugins-good gstreamer1.0-plugins-ugly \
+  gstreamer1.0-pipewire x264
 ```
 
-Works on any Wayland compositor that advertises `wlr-screencopy`: niri,
-sway, Hyprland, wayfire, river, KDE on wlroots. GNOME-only Wayland not
-supported yet.
+Supported:
+- wlroots-style compositors (niri, sway, Hyprland, wayfire, river,
+  KDE on wlroots) → in-process libwayland wlr-screencopy capture.
+- GNOME / Ubuntu Wayland → xdg-desktop-portal ScreenCast via the
+  bundled Python helper + GStreamer pipeline.
 
 ## Usage
 
