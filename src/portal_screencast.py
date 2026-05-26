@@ -22,11 +22,12 @@ from dbus.mainloop.glib import DBusGMainLoop
 
 
 def main():
-    if len(sys.argv) != 3:
-        print(f"usage: {sys.argv[0]} <output.mkv> <framerate>", file=sys.stderr)
+    if len(sys.argv) not in (3, 4):
+        print(f"usage: {sys.argv[0]} <output> <framerate> [bitrate-kbps]", file=sys.stderr)
         sys.exit(2)
     out_path = sys.argv[1]
     framerate = int(sys.argv[2])
+    bitrate_kbps = int(sys.argv[3]) if len(sys.argv) == 4 else 20000
 
     DBusGMainLoop(set_as_default=True)
     Gst.init(None)
@@ -107,10 +108,23 @@ def main():
     def launch_pipeline(fd, node_id):
         # Matroska container handles abrupt close better than mp4.
         # WebM (VP8 + webmmux) by default; H264/Matroska if path ends in .mkv/.mp4.
+        # Quality knobs:
+        #   VP8: end-usage=vbr, cpu-used=4 (balance), keyframe every ~3s
+        #   H264: preset=veryfast (faster than medium, quality > ultrafast), CRF-ish via bitrate
+        target_bps = bitrate_kbps * 1000
         if out_path.endswith(".webm"):
-            enc = "vp8enc deadline=1 cpu-used=8 threads=4 target-bitrate=8000000 ! webmmux streamable=true"
+            enc = (
+                f"vp8enc deadline=1000000 cpu-used=4 threads=4 "
+                f"end-usage=vbr target-bitrate={target_bps} "
+                f"keyframe-max-dist={framerate * 3} "
+                f"! webmmux streamable=true"
+            )
         else:
-            enc = "x264enc speed-preset=ultrafast tune=zerolatency bitrate=8000 ! matroskamux streamable=true"
+            enc = (
+                f"x264enc speed-preset=veryfast tune=zerolatency "
+                f"bitrate={bitrate_kbps} key-int-max={framerate * 3} "
+                f"! matroskamux streamable=true"
+            )
         pipeline_str = (
             f"pipewiresrc fd={fd} path={node_id} do-timestamp=true ! "
             f"videoconvert ! videorate ! video/x-raw,framerate={framerate}/1 ! "

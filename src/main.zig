@@ -17,13 +17,16 @@ const usage =
     \\OPTIONS:
     \\    -d, --duration <secs>   Record for N seconds (default: until Ctrl+C)
     \\    -r, --framerate <fps>   Video framerate (default: 30)
+    \\    -b, --bitrate <kbps>    Video bitrate in kbps (default: 20000 = 20 Mbps)
+    \\    -q, --quality <name>    Preset: low (8M) | medium (15M) | high (25M) | ultra (40M)
     \\        --monitor           Capture system audio output (default: microphone)
     \\    -h, --help              Print this help
     \\
     \\EXAMPLES:
     \\    one-cap                          # → ~/Videos/onecap-20260526-173025.webm
     \\    one-cap demo.mp4 -d 10
-    \\    one-cap clip.webm --monitor
+    \\    one-cap clip.webm -q ultra
+    \\    one-cap clip.webm -b 30000       # 30 Mbps
     \\
 ;
 
@@ -57,6 +60,24 @@ pub fn main() !void {
             i += 1;
             if (i >= args.len) return error.MissingValue;
             opts.framerate = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "-b") or std.mem.eql(u8, a, "--bitrate")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            opts.video_bitrate_kbps = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "-q") or std.mem.eql(u8, a, "--quality")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            const q = args[i];
+            opts.video_bitrate_kbps = if (std.mem.eql(u8, q, "low"))
+                8000
+            else if (std.mem.eql(u8, q, "medium"))
+                15000
+            else if (std.mem.eql(u8, q, "high"))
+                25000
+            else if (std.mem.eql(u8, q, "ultra"))
+                40000
+            else
+                return error.UnknownQualityPreset;
         } else if (std.mem.eql(u8, a, "--monitor")) {
             opts.audio_source = .monitor;
         } else if (a.len > 0 and a[0] == '-') {

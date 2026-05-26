@@ -33,6 +33,7 @@ pub const Backend = enum {
 pub const Config = struct {
     output_path: []const u8, // path the backend writes to (intermediate, before mux)
     framerate: u32 = 30,
+    video_bitrate_kbps: u32 = 20000,
     display: []const u8 = ":0.0",
     backend: ?Backend = null,
 };
@@ -142,6 +143,7 @@ fn buildArgv(
     errdefer freeArgv(allocator, &list);
 
     const fr = try std.fmt.allocPrint(allocator, "{d}", .{cfg.framerate});
+    const br = try std.fmt.allocPrint(allocator, "{d}", .{cfg.video_bitrate_kbps});
     const path = try allocator.dupe(u8, cfg.output_path);
     const display = try allocator.dupe(u8, cfg.display);
 
@@ -152,6 +154,7 @@ fn buildArgv(
             try list.append(script);
             try list.append(path);
             try list.append(fr);
+            try list.append(br);
             allocator.free(display);
         },
         .wf_recorder => {
@@ -161,8 +164,10 @@ fn buildArgv(
             try list.append(try allocator.dupe(u8, "-r"));
             try list.append(fr);
             allocator.free(display);
+            allocator.free(br);
         },
         .ffmpeg_x11grab => {
+            const br_k = try std.fmt.allocPrint(allocator, "{d}k", .{cfg.video_bitrate_kbps});
             try list.append(try allocator.dupe(u8, "ffmpeg"));
             try list.append(try allocator.dupe(u8, "-y"));
             try list.append(try allocator.dupe(u8, "-f"));
@@ -174,12 +179,16 @@ fn buildArgv(
             try list.append(try allocator.dupe(u8, "-c:v"));
             try list.append(try allocator.dupe(u8, "libx264"));
             try list.append(try allocator.dupe(u8, "-preset"));
-            try list.append(try allocator.dupe(u8, "ultrafast"));
+            try list.append(try allocator.dupe(u8, "veryfast"));
+            try list.append(try allocator.dupe(u8, "-b:v"));
+            try list.append(br_k);
             try list.append(try allocator.dupe(u8, "-pix_fmt"));
             try list.append(try allocator.dupe(u8, "yuv420p"));
             try list.append(path);
+            allocator.free(br);
         },
         .ffmpeg_kmsgrab => {
+            const br_k = try std.fmt.allocPrint(allocator, "{d}k", .{cfg.video_bitrate_kbps});
             try list.append(try allocator.dupe(u8, "ffmpeg"));
             try list.append(try allocator.dupe(u8, "-y"));
             try list.append(try allocator.dupe(u8, "-f"));
@@ -192,10 +201,15 @@ fn buildArgv(
             try list.append(try allocator.dupe(u8, "hwdownload,format=bgr0"));
             try list.append(try allocator.dupe(u8, "-c:v"));
             try list.append(try allocator.dupe(u8, "libx264"));
+            try list.append(try allocator.dupe(u8, "-preset"));
+            try list.append(try allocator.dupe(u8, "veryfast"));
+            try list.append(try allocator.dupe(u8, "-b:v"));
+            try list.append(br_k);
             try list.append(try allocator.dupe(u8, "-pix_fmt"));
             try list.append(try allocator.dupe(u8, "yuv420p"));
             try list.append(path);
             allocator.free(display);
+            allocator.free(br);
         },
     }
 

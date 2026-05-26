@@ -8,6 +8,7 @@ pub const Options = struct {
     output_path: []const u8,
     duration_seconds: ?u32,
     framerate: u32 = 30,
+    video_bitrate_kbps: u32 = 20000, // 20 Mbps default — good for 1440p
     audio_source: audio.Source = .microphone,
     sample_rate: u32 = 48000,
     channels: u8 = 2,
@@ -33,6 +34,7 @@ pub fn record(allocator: std.mem.Allocator, opts: Options) !void {
     var screen_rec = try screen.Recorder.start(allocator, .{
         .output_path = tmp_video,
         .framerate = opts.framerate,
+        .video_bitrate_kbps = opts.video_bitrate_kbps,
         .backend = backend,
     });
     defer screen_rec.deinit();
