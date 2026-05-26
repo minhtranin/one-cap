@@ -115,7 +115,8 @@ jobs:
           export XDG_CURRENT_DESKTOP=sway
           export XDG_SESSION_DESKTOP=sway
 
-          ./zig-out/bin/one-cap -d 5 /tmp/test.mkv > /tmp/out.log 2>&1 || true
+          timeout --signal=KILL 30 \
+            ./zig-out/bin/one-cap -d 5 /tmp/test.mkv > /tmp/out.log 2>&1 || true
 
           echo "================ /tmp/out.log ================"
           cat /tmp/out.log
@@ -166,9 +167,6 @@ jobs:
           mkdir -p $HOME/.config/sway
           cat > $HOME/.config/sway/config <<'EOF'
           output HEADLESS-1 resolution 1280x720
-          # immediately destroy any window other than the one-cap toplevel
-          for_window [app_id="^(?!one-cap).*"] kill
-          exec dbus-launch --exit-with-session true
           EOF
 
           export XDG_RUNTIME_DIR=/run/user/$(id -u)
@@ -205,11 +203,11 @@ jobs:
           OUT=/tmp/ci-smoke.mkv
           rm -f "$OUT"
 
-          # --no-ui not implemented; the GTK window will spawn but the -d flag
-          # auto-stops after 3s. We disable PulseAudio capture failures from
-          # tanking the run by failing-soft on the audio init (recorder still
-          # writes video).
-          ./${{ steps.appimage.outputs.path }} -d 3 "$OUT" 2>&1 | tee onecap.log || true
+          # -d 3 should auto-stop after 3s. Wrap in `timeout 30` as a hard
+          # backstop: if GTK init or wlr-screencopy hangs inside the AppImage
+          # bundle, kill it instead of stalling the workflow indefinitely.
+          timeout --signal=KILL 30 \
+            ./${{ steps.appimage.outputs.path }} -d 3 "$OUT" 2>&1 | tee onecap.log || true
 
           echo "--- ffprobe ---"
           ffprobe -v error -show_streams "$OUT" || true
