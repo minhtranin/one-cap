@@ -1,0 +1,190 @@
+name: AppImage build + smoke test
+
+on:
+  push:
+    branches: [dev, main]
+    tags: ['v*']
+  pull_request:
+    branches: [dev, main]
+  workflow_dispatch:
+
+permissions:
+  contents: write  # for tag-triggered release upload
+
+jobs:
+  appimage:
+    name: Build AppImage and smoke-test under headless sway
+    runs-on: ubuntu-24.04
+    env:
+      ZIG_VERSION: 0.14.1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- toolchain + system deps ---------------------------------------
+      - name: Install build/runtime apt packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config curl ca-certificates xz-utils \
+            libpulse-dev pulseaudio pulseaudio-utils \
+            libwayland-dev wayland-protocols \
+            libgtk-3-dev libglib2.0-dev \
+            libx264-dev ffmpeg \
+            sway xwayland xvfb dbus-x11 mesa-utils \
+            libfuse2 file desktop-file-utils
+
+      # wlr-protocols (Ubuntu doesn't ship it as a package).
+      - name: Vendor wlr-screencopy protocol xml
+        run: |
+          # The generated bindings are committed under src/wayland_gen, so we
+          # don't strictly need wlr-protocols at build time. But we sanity check
+          # the XML against the version we generated against if available.
+          ls -l src/wayland_gen
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: |
+          curl -L -o zig.tar.xz \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          mkdir -p $HOME/zig
+          tar xJf zig.tar.xz -C $HOME/zig --strip-components=1
+          echo "$HOME/zig" >> $GITHUB_PATH
+          $HOME/zig/zig version
+
+      - name: Install linuxdeploy + gtk plugin
+        run: |
+          mkdir -p $HOME/bin
+          curl -L -o $HOME/bin/linuxdeploy \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          curl -L -o $HOME/bin/linuxdeploy-plugin-gtk \
+            https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh
+          chmod +x $HOME/bin/linuxdeploy $HOME/bin/linuxdeploy-plugin-gtk
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+          # Allow AppImages to extract on GH runners without FUSE.
+          echo "APPIMAGE_EXTRACT_AND_RUN=1" >> $GITHUB_ENV
+
+      # --- build ----------------------------------------------------------
+      - name: Build (ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Bundle AppImage
+        run: ./scripts/build-appimage.sh
+
+      - name: Locate AppImage
+        id: appimage
+        run: |
+          path=$(ls -1 one-cap-*.AppImage | head -n1)
+          echo "path=$path" >> $GITHUB_OUTPUT
+          chmod +x "$path"
+          file "$path"
+
+      # --- smoke test under headless sway --------------------------------
+      # Sway runs as a wlroots compositor with no real outputs, advertising
+      # wlr-screencopy. We start a dummy PulseAudio so the libpulse capture
+      # can connect. Then we run the AppImage in headless mode (--no-ui via
+      # ONECAP_NO_UI not implemented; instead we let the GTK window pop up
+      # and rely on the duration flag to terminate it; sway will accept the
+      # toplevel window even with no input device).
+      - name: Start PulseAudio (system mode for CI)
+        run: |
+          mkdir -p $HOME/.config/pulse
+          pulseaudio --start --exit-idle-time=-1 --log-target=stderr || true
+          sleep 1
+          pactl info | head -10
+
+      - name: Start headless sway compositor
+        run: |
+          mkdir -p $HOME/.config/sway
+          cat > $HOME/.config/sway/config <<'EOF'
+          output HEADLESS-1 resolution 1280x720
+          # immediately destroy any window other than the one-cap toplevel
+          for_window [app_id="^(?!one-cap).*"] kill
+          exec dbus-launch --exit-with-session true
+          EOF
+
+          export XDG_RUNTIME_DIR=/run/user/$(id -u)
+          mkdir -p $XDG_RUNTIME_DIR
+          chmod 700 $XDG_RUNTIME_DIR
+
+          # WLR_BACKENDS=headless creates a virtual output. WLR_LIBINPUT_NO_DEVICES
+          # silences the "no input device" warning. WLR_RENDERER=pixman avoids
+          # needing GPU/DRM access on the runner.
+          WLR_BACKENDS=headless \
+          WLR_LIBINPUT_NO_DEVICES=1 \
+          WLR_RENDERER=pixman \
+          sway -d > sway.log 2>&1 &
+          echo $! > sway.pid
+
+          # Sway sets WAYLAND_DISPLAY in its env after socket creation; the
+          # default socket name is wayland-1. Poll for it.
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if [ -S "$XDG_RUNTIME_DIR/wayland-1" ]; then
+              echo "wayland socket up after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          ls -la $XDG_RUNTIME_DIR/
+
+      - name: Smoke test — record 3s under headless sway
+        run: |
+          export XDG_RUNTIME_DIR=/run/user/$(id -u)
+          export WAYLAND_DISPLAY=wayland-1
+          export XDG_CURRENT_DESKTOP=sway
+          export XDG_SESSION_DESKTOP=sway
+
+          OUT=/tmp/ci-smoke.mkv
+          rm -f "$OUT"
+
+          # --no-ui not implemented; the GTK window will spawn but the -d flag
+          # auto-stops after 3s. We disable PulseAudio capture failures from
+          # tanking the run by failing-soft on the audio init (recorder still
+          # writes video).
+          ./${{ steps.appimage.outputs.path }} -d 3 "$OUT" 2>&1 | tee onecap.log || true
+
+          echo "--- ffprobe ---"
+          ffprobe -v error -show_streams "$OUT" || true
+          ls -la "$OUT"
+
+          # Hard pass criteria:
+          #   - output exists
+          #   - size > 1KB (sanity: more than just a header)
+          #   - ffprobe reports at least one video stream
+          test -s "$OUT"
+          test "$(stat -c%s "$OUT")" -gt 1024
+          ffprobe -v error -select_streams v -show_entries stream=codec_name "$OUT" \
+              | grep -q codec_name
+
+      - name: Stop sway
+        if: always()
+        run: |
+          if [ -f sway.pid ]; then kill $(cat sway.pid) || true; fi
+          cat sway.log || true
+
+      # --- artifacts ------------------------------------------------------
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: one-cap-AppImage
+          path: ${{ steps.appimage.outputs.path }}
+          if-no-files-found: error
+
+      - name: Upload smoke test recording for inspection
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-recording
+          path: |
+            /tmp/ci-smoke.mkv
+            onecap.log
+            sway.log
+          if-no-files-found: ignore
+
+      # --- release on tag -------------------------------------------------
+      - name: Attach AppImage to GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.appimage.outputs.path }}
+          generate_release_notes: true

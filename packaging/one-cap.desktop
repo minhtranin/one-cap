@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=one-cap
+GenericName=Screen Recorder
+Comment=Wayland screen + audio recorder (wlr-screencopy)
+Exec=one-cap
+Icon=one-cap
+Terminal=false
+Categories=AudioVideo;Recorder;
+StartupNotify=true
+StartupWMClass=one-cap
