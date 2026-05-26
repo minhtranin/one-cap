@@ -156,6 +156,40 @@ def main():
         pipeline.set_state(Gst.State.PLAYING)
         # Signal readiness to parent
         print("PORTAL_READY", flush=True)
+        # Watch stdin for commands from Zig parent: PAUSE / RESUME / STOP
+        GLib.unix_fd_add_full(
+            GLib.PRIORITY_DEFAULT,
+            sys.stdin.fileno(),
+            GLib.IOCondition.IN | GLib.IOCondition.HUP,
+            on_stdin_cmd,
+            None,
+        )
+
+    def on_stdin_cmd(fd, cond, _user):
+        if cond & GLib.IOCondition.HUP:
+            shutdown()
+            return False
+        line = sys.stdin.readline()
+        if not line:
+            shutdown()
+            return False
+        cmd = line.strip().upper()
+        p = state["pipeline"]
+        if p is None:
+            return True
+        if cmd == "PAUSE" and not state.get("paused"):
+            p.set_state(Gst.State.PAUSED)
+            state["paused"] = True
+            print("PAUSED", flush=True)
+        elif cmd == "RESUME" and state.get("paused"):
+            p.set_state(Gst.State.PLAYING)
+            state["paused"] = False
+            print("RESUMED", flush=True)
+        elif cmd == "STOP":
+            print("STOPPED", flush=True)
+            shutdown()
+            return False
+        return True
 
     def shutdown(*_):
         p = state["pipeline"]

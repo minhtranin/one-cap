@@ -67,11 +67,23 @@ pub const Recorder = struct {
 
     pub fn stop(self: *Recorder) !void {
         if (self.child.stdin) |stdin| {
+            // Tell the portal helper to finalize the pipeline cleanly. It
+            // listens on stdin for PAUSE/RESUME/STOP.
+            _ = stdin.writeAll("STOP\n") catch {};
             stdin.close();
             self.child.stdin = null;
         }
-        std.posix.kill(self.child.id, std.posix.SIG.INT) catch {};
+        // Helper exits on its own after handling STOP; SIGINT as backstop only
+        // if it stalls.
         _ = self.child.wait() catch {};
+    }
+
+    /// Forwards a line (with trailing newline) to the screen child's stdin.
+    /// Only meaningful for the portal_pipewire backend currently.
+    pub fn sendCommand(self: *Recorder, line: []const u8) !void {
+        if (self.backend != .portal_pipewire) return; // other backends ignore
+        const stdin = self.child.stdin orelse return error.NoStdin;
+        try stdin.writeAll(line);
     }
 
     pub fn deinit(self: *Recorder) void {

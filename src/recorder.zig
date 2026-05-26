@@ -1,29 +1,30 @@
-//! Orchestrate: spawn screen subprocess + audio thread, then mux to final mp4.
+//! Orchestrate: spawn screen subprocess + audio thread + GTK control window.
+//! The GTK loop runs on the calling thread; a controller thread mirrors UI
+//! state into the screen child (via stdin commands) and audio capture (via
+//! atomic flag). When the user clicks Stop / closes the window / duration
+//! elapses, GTK quits and the recorder finalizes + muxes.
 
 const std = @import("std");
 const audio = @import("audio.zig");
 const screen = @import("screen.zig");
+const ui = @import("ui.zig");
 
 pub const Options = struct {
     output_path: []const u8,
     duration_seconds: ?u32,
     framerate: u32 = 30,
-    video_bitrate_kbps: u32 = 40000, // 40 Mbps = ultra default
-    audio_source: audio.Source = .monitor, // system audio by default
+    video_bitrate_kbps: u32 = 40000,
+    audio_source: audio.Source = .monitor,
     sample_rate: u32 = 48000,
     channels: u8 = 2,
+    show_ui: bool = true,
 };
 
 pub fn record(allocator: std.mem.Allocator, opts: Options) !void {
     const tmp_audio = "/tmp/one-cap-audio.raw";
     std.fs.cwd().deleteFile(tmp_audio) catch {};
 
-    // Detect backend first so we can pick a matching intermediate file extension.
     const backend = try screen.detectBackend(allocator);
-
-    // Intermediate file ext follows the desired output container so the portal
-    // helper picks the matching encoder (VP8 for webm, x264 for mkv/mp4). This
-    // lets the mux step stream-copy video instead of re-encoding.
     const out_is_webm = std.mem.endsWith(u8, opts.output_path, ".webm");
     const tmp_video = switch (backend) {
         .portal_pipewire => if (out_is_webm) "/tmp/one-cap-video.webm" else "/tmp/one-cap-video.mkv",
@@ -53,10 +54,26 @@ pub fn record(allocator: std.mem.Allocator, opts: Options) !void {
 
     std.log.info("recording... output={s}", .{opts.output_path});
 
-    if (opts.duration_seconds) |secs| {
-        std.time.sleep(@as(u64, secs) * std.time.ns_per_s);
+    if (opts.show_ui) {
+        var state = ui.State{
+            .duration_seconds = opts.duration_seconds orelse 0,
+        };
+
+        // Controller thread: mirrors UI state into screen-child stdin commands
+        // and audio capture pause flag. Polls every 100ms — UI clicks debounce
+        // naturally inside this window.
+        const ctrl = try std.Thread.spawn(.{}, controllerLoop, .{ &state, &screen_rec, &audio_cap });
+
+        ui.run(&state) catch |e| std.log.err("ui error: {}", .{e});
+        // UI exited (user clicked Stop, closed window, or duration elapsed).
+        ctrl.join();
     } else {
-        try waitForInterrupt();
+        // Headless path: same lifecycle, no UI thread.
+        if (opts.duration_seconds) |secs| {
+            std.time.sleep(@as(u64, secs) * std.time.ns_per_s);
+        } else {
+            try waitForInterrupt();
+        }
     }
 
     std.log.info("stopping capture...", .{});
@@ -72,6 +89,20 @@ pub fn record(allocator: std.mem.Allocator, opts: Options) !void {
     std.log.info("done → {s}", .{opts.output_path});
 }
 
+fn controllerLoop(state: *ui.State, screen_rec: *screen.Recorder, audio_cap: *audio.Capture) void {
+    var last_paused = false;
+    while (!state.stop_requested.load(.acquire)) {
+        const now_paused = state.isPaused();
+        if (now_paused != last_paused) {
+            audio_cap.setPaused(now_paused);
+            const cmd: []const u8 = if (now_paused) "PAUSE\n" else "RESUME\n";
+            screen_rec.sendCommand(cmd) catch |e| std.log.err("send cmd failed: {}", .{e});
+            last_paused = now_paused;
+        }
+        std.time.sleep(100 * std.time.ns_per_ms);
+    }
+}
+
 fn mux(
     allocator: std.mem.Allocator,
     video_path: []const u8,
@@ -83,8 +114,6 @@ fn mux(
     const ch = try std.fmt.allocPrint(allocator, "{d}", .{opts.channels});
     defer allocator.free(ch);
 
-    // Stream-copy video always (portal helper picked the right codec for the container).
-    // Audio encoder follows container: webm → Opus, mp4/mkv → AAC.
     const audio_codec: []const u8 = if (std.mem.endsWith(u8, opts.output_path, ".webm"))
         "libopus"
     else

@@ -31,6 +31,7 @@ pub const Capture = struct {
     simple: *c.pa_simple,
     cfg: Config,
     running: std.atomic.Value(bool),
+    paused: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(cfg: Config) Error!Capture {
         var spec = c.pa_sample_spec{
@@ -96,6 +97,14 @@ pub const Capture = struct {
         return self.running.load(.acquire);
     }
 
+    pub fn setPaused(self: *Capture, p: bool) void {
+        self.paused.store(p, .release);
+    }
+
+    pub fn isPaused(self: *Capture) bool {
+        return self.paused.load(.acquire);
+    }
+
     /// Fill buffer with raw bytes from pulse. Buffer size = fragsize works well.
     pub fn readBytes(self: *Capture, buf: []u8) Error!void {
         if (!self.running.load(.acquire)) return Error.Terminated;
@@ -120,6 +129,10 @@ pub fn captureLoop(cap: *Capture, file: std.fs.File) void {
             std.log.err("audio loop error: {}", .{e});
             break;
         };
+        // While paused, we still drain pulse so its ring buffer doesn't back up,
+        // but we drop the samples instead of writing — keeps audio timeline in
+        // sync with the video, which is also paused by GStreamer.
+        if (cap.isPaused()) continue;
         _ = file.writeAll(buf[0..chunk]) catch |e| {
             std.log.err("audio file write failed: {}", .{e});
             break;
