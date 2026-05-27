@@ -1,0 +1,7 @@
+{
+  "uuid": "onecap-pin@local",
+  "name": "OneCap Pin",
+  "description": "Keep the one-cap recorder control bar above all windows, including fullscreen apps.",
+  "shell-version": ["45", "46", "47", "48"],
+  "url": "https://github.com/minhtranin/one-cap"
+}
