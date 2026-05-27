@@ -21,6 +21,13 @@ pub const Options = struct {
 };
 
 pub fn record(allocator: std.mem.Allocator, opts: Options) !void {
+    if (opts.show_ui) {
+        return recordWithUi(allocator, opts);
+    }
+    return recordHeadless(allocator, opts);
+}
+
+fn recordHeadless(allocator: std.mem.Allocator, opts: Options) !void {
     const tmp_audio = "/tmp/one-cap-audio.raw";
     const tmp_mic = "/tmp/one-cap-mic.raw";
     std.fs.cwd().deleteFile(tmp_audio) catch {};
@@ -74,48 +81,103 @@ pub fn record(allocator: std.mem.Allocator, opts: Options) !void {
         mic_thread = try std.Thread.spawn(.{}, audio.captureLoop, .{ &mic_cap.?, mic_file.? });
     }
 
+    std.log.info("recording (headless)... output={s}", .{opts.output_path});
+
+    if (opts.duration_seconds) |secs| {
+        std.time.sleep(@as(u64, secs) * std.time.ns_per_s);
+    } else {
+        try waitForInterrupt();
+    }
+
+    std.log.info("stopping capture...", .{});
+    audio_cap.stop();
+    audio_thread.join();
+    audio_cap.deinit();
+    audio_file.close();
+
+    const had_mic_track = mic_cap != null;
+    if (mic_cap) |*mc| {
+        mc.stop();
+        mic_thread.?.join();
+        mc.deinit();
+        if (mic_file) |mf| mf.close();
+    }
+
+    try screen_rec.stop();
+
+    try mux(allocator, tmp_video, tmp_audio, if (had_mic_track) tmp_mic else null, opts);
+
+    std.log.info("done → {s}", .{opts.output_path});
+}
+
+/// GUI mode: capture starts immediately on launch (like the old behavior).
+/// UI window shows live counter + Pause/Stop/Mic/Cursor buttons. Counter
+/// freezes while paused. Stop closes the window and finalizes the file.
+fn recordWithUi(allocator: std.mem.Allocator, opts: Options) !void {
+    const tmp_audio = "/tmp/one-cap-audio.raw";
+    const tmp_mic = "/tmp/one-cap-mic.raw";
+    std.fs.cwd().deleteFile(tmp_audio) catch {};
+    std.fs.cwd().deleteFile(tmp_mic) catch {};
+
+    const backend = try screen.detectBackend(allocator);
+    const tmp_video = switch (backend) {
+        .wlr_screencopy, .portal_pipewire => "/tmp/one-cap-video.mkv",
+        else => "/tmp/one-cap-video.mp4",
+    };
+    std.fs.cwd().deleteFile(tmp_video) catch {};
+
+    var screen_rec = try screen.Recorder.start(allocator, .{
+        .output_path = tmp_video,
+        .framerate = opts.framerate,
+        .video_bitrate_kbps = opts.video_bitrate_kbps,
+        .backend = backend,
+    });
+    defer screen_rec.deinit();
+
+    var audio_cap = try audio.Capture.init(.{
+        .sample_rate = opts.sample_rate,
+        .channels = opts.channels,
+        .source = opts.audio_source,
+    });
+    errdefer audio_cap.deinit();
+
+    const audio_file = try std.fs.cwd().createFile(tmp_audio, .{});
+    errdefer audio_file.close();
+
+    var audio_thread = try std.Thread.spawn(.{}, audio.captureLoop, .{ &audio_cap, audio_file });
+
+    const want_mic_track = opts.audio_source == .monitor;
+    var mic_cap: ?audio.Capture = null;
+    var mic_thread: ?std.Thread = null;
+    var mic_file: ?std.fs.File = null;
+    if (want_mic_track) {
+        var mc = try audio.Capture.init(.{
+            .sample_rate = opts.sample_rate,
+            .channels = opts.channels,
+            .source = .microphone,
+        });
+        mc.setPaused(true);
+        mic_cap = mc;
+        mic_file = try std.fs.cwd().createFile(tmp_mic, .{});
+        mic_thread = try std.Thread.spawn(.{}, audio.captureLoop, .{ &mic_cap.?, mic_file.? });
+    }
+
     std.log.info("recording... output={s}", .{opts.output_path});
 
-    if (opts.show_ui) {
-        var state = ui.State{
-            .duration_seconds = opts.duration_seconds orelse 0,
-        };
+    var state = ui.State{
+        .duration_seconds = opts.duration_seconds orelse 0,
+    };
+    state.recording_start_ns.store(std.time.nanoTimestamp(), .release);
 
-        // Controller thread: mirrors UI state into screen-child stdin commands
-        // and audio capture pause flag. Polls every 100ms — UI clicks debounce
-        // naturally inside this window.
-        const ctrl = try std.Thread.spawn(.{}, controllerLoop, .{
-            &state, &screen_rec, &audio_cap, if (mic_cap != null) &mic_cap.? else null,
-        });
+    const ctrl = try std.Thread.spawn(.{}, controllerLoop, .{
+        &state, &screen_rec, &audio_cap, if (mic_cap != null) &mic_cap.? else null,
+    });
 
-        var ui_failed = false;
-        ui.run(&state) catch |e| {
-            std.log.err("ui error: {} — falling back to headless duration/SIGINT", .{e});
-            ui_failed = true;
-        };
-
-        if (ui_failed) {
-            // GTK couldn't init (e.g. no DISPLAY in CI / SSH session). Honor
-            // the requested duration headlessly so the recording still finishes
-            // instead of running forever.
-            if (opts.duration_seconds) |secs| {
-                std.time.sleep(@as(u64, secs) * std.time.ns_per_s);
-            } else {
-                waitForInterrupt() catch {};
-            }
-            state.requestStop();
-        }
-        // UI exited (user clicked Stop, closed window, duration elapsed, or
-        // headless fallback above completed).
-        ctrl.join();
-    } else {
-        // Headless path: same lifecycle, no UI thread.
-        if (opts.duration_seconds) |secs| {
-            std.time.sleep(@as(u64, secs) * std.time.ns_per_s);
-        } else {
-            try waitForInterrupt();
-        }
-    }
+    ui.run(&state) catch |e| {
+        std.log.err("ui error: {} — stopping", .{e});
+        state.requestStop();
+    };
+    ctrl.join();
 
     std.log.info("stopping capture...", .{});
     audio_cap.stop();

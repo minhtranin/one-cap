@@ -1,7 +1,9 @@
-//! Tiny floating GTK3 control window: status label + Pause/Resume + Stop.
+//! Tiny floating GTK3 control window. Shows live recording timer + Pause /
+//! Stop / Mic / Cursor buttons. Counter freezes while paused (cumulative
+//! paused time is subtracted).
 //! Owns the GTK main loop on the calling thread (must be the OS main thread).
 //! All callbacks toggle atomic flags on the shared State, which the recorder
-//! thread polls/observes.
+//! controller thread polls/observes.
 
 const std = @import("std");
 
@@ -9,8 +11,6 @@ const c = @cImport({
     @cInclude("gtk/gtk.h");
 });
 
-// Version baked in at build time from the repo-root VERSION file via
-// build.zig (which trims + falls back to a hard-coded default if missing).
 const VERSION: []const u8 = @import("build_options").version;
 
 pub const State = struct {
@@ -19,7 +19,13 @@ pub const State = struct {
     mic_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     cursor_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 
-    // Set by the recorder once duration_seconds is known. 0 = open-ended.
+    // Counter math. Recorder sets recording_start_ns once on launch. UI thread
+    // owns pause_started_ns + total_paused_ns under the GTK main loop.
+    recording_start_ns: std.atomic.Value(i128) = std.atomic.Value(i128).init(0),
+    pause_started_ns: i128 = 0,
+    total_paused_ns: i128 = 0,
+
+    // 0 = open-ended.
     duration_seconds: u32 = 0,
 
     pub fn requestStop(self: *State) void {
@@ -64,22 +70,16 @@ const Widgets = struct {
     mic_btn: *c.GtkWidget,
     cursor_btn: *c.GtkWidget,
     state: *State,
-    start_ns: i128,
 };
 
 var widgets_global: ?*Widgets = null;
 
-/// Blocks until the user clicks Stop, closes the window, or duration elapses.
-/// Returns when GTK main loop has quit. Caller then finalizes capture.
 pub fn run(state: *State) !void {
     if (c.gtk_init_check(null, null) == 0) return error.GtkInitFailed;
 
-    // Set Wayland app-id so compositor rules can target the window
-    // (e.g. niri `match app-id="one-cap"`). GTK uses program class.
     c.g_set_prgname("one-cap");
     c.gdk_set_program_class("one-cap");
 
-    // CSS: roomy buttons + readable labels for the larger control bar.
     const css =
         \\button { padding: 6px 10px; min-height: 0px; min-width: 0px; font-size: 18px; }
         \\label { font-size: 16px; }
@@ -99,9 +99,6 @@ pub fn run(state: *State) !void {
     c.gtk_window_set_resizable(@ptrCast(win), 0);
     c.gtk_window_set_decorated(@ptrCast(win), 0);
     c.gtk_window_set_skip_taskbar_hint(@ptrCast(win), 1);
-
-    // Wayland forbids client positioning; on niri use a window rule by
-    // app_id="one-cap" to pin to top-right. X11 honors the move below.
     c.gtk_window_set_role(@ptrCast(win), "one-cap-control");
     c.gtk_window_set_gravity(@ptrCast(win), c.GDK_GRAVITY_NORTH_EAST);
     c.gtk_window_move(@ptrCast(win), 10, 10);
@@ -113,20 +110,10 @@ pub fn run(state: *State) !void {
     c.gtk_widget_set_margin_end(box, 14);
     c.gtk_container_add(@ptrCast(win), box);
 
-    // Drag handle: an EventBox wraps the brand+status labels. Pressing on
-    // it triggers gtk_window_begin_move_drag — that's the GTK way to make
-    // a decoration-less window draggable on both X11 and Wayland.
     const drag_area = c.gtk_event_box_new();
     c.gtk_widget_add_events(drag_area, c.GDK_BUTTON_PRESS_MASK);
     c.gtk_box_pack_start(@ptrCast(box), drag_area, 1, 1, 0);
-    _ = c.g_signal_connect_data(
-        drag_area,
-        "button-press-event",
-        @ptrCast(&onDragPress),
-        win,
-        null,
-        0,
-    );
+    _ = c.g_signal_connect_data(drag_area, "button-press-event", @ptrCast(&onDragPress), win, null, 0);
 
     const drag_inner = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 10);
     c.gtk_container_add(@ptrCast(drag_area), drag_inner);
@@ -146,7 +133,7 @@ pub fn run(state: *State) !void {
     c.gtk_box_pack_start(@ptrCast(drag_inner), status, 1, 1, 0);
 
     const cursor_btn = c.gtk_button_new_with_label("🖱");
-    const mic_btn = c.gtk_button_new_with_label("🎤");
+    const mic_btn = c.gtk_button_new_with_label("🔇");
     const pause_btn = c.gtk_button_new_with_label("⏸");
     const stop_btn = c.gtk_button_new_with_label("⏹");
     c.gtk_widget_set_size_request(cursor_btn, 56, 44);
@@ -155,10 +142,8 @@ pub fn run(state: *State) !void {
     c.gtk_widget_set_size_request(stop_btn, 56, 44);
     c.gtk_widget_set_tooltip_text(cursor_btn, "Toggle cursor capture");
     c.gtk_widget_set_tooltip_text(mic_btn, "Toggle microphone");
-    c.gtk_button_set_relief(@ptrCast(cursor_btn), c.GTK_RELIEF_NORMAL);
-    c.gtk_button_set_relief(@ptrCast(mic_btn), c.GTK_RELIEF_NORMAL);
-    c.gtk_button_set_relief(@ptrCast(pause_btn), c.GTK_RELIEF_NORMAL);
-    c.gtk_button_set_relief(@ptrCast(stop_btn), c.GTK_RELIEF_NORMAL);
+    c.gtk_widget_set_tooltip_text(pause_btn, "Pause / Resume");
+    c.gtk_widget_set_tooltip_text(stop_btn, "Stop and close");
     c.gtk_box_pack_start(@ptrCast(box), cursor_btn, 0, 0, 0);
     c.gtk_box_pack_start(@ptrCast(box), mic_btn, 0, 0, 0);
     c.gtk_box_pack_start(@ptrCast(box), pause_btn, 0, 0, 0);
@@ -171,54 +156,16 @@ pub fn run(state: *State) !void {
         .mic_btn = mic_btn,
         .cursor_btn = cursor_btn,
         .state = state,
-        .start_ns = std.time.nanoTimestamp(),
     };
     widgets_global = &widgets;
 
-    _ = c.g_signal_connect_data(
-        cursor_btn,
-        "clicked",
-        @ptrCast(&onCursorClicked),
-        null,
-        null,
-        0,
-    );
-    _ = c.g_signal_connect_data(
-        mic_btn,
-        "clicked",
-        @ptrCast(&onMicClicked),
-        null,
-        null,
-        0,
-    );
-    _ = c.g_signal_connect_data(
-        pause_btn,
-        "clicked",
-        @ptrCast(&onPauseClicked),
-        null,
-        null,
-        0,
-    );
-    _ = c.g_signal_connect_data(
-        stop_btn,
-        "clicked",
-        @ptrCast(&onStopClicked),
-        null,
-        null,
-        0,
-    );
-    _ = c.g_signal_connect_data(
-        win,
-        "destroy",
-        @ptrCast(&onDestroy),
-        null,
-        null,
-        0,
-    );
+    _ = c.g_signal_connect_data(cursor_btn, "clicked", @ptrCast(&onCursorClicked), null, null, 0);
+    _ = c.g_signal_connect_data(mic_btn, "clicked", @ptrCast(&onMicClicked), null, null, 0);
+    _ = c.g_signal_connect_data(pause_btn, "clicked", @ptrCast(&onPauseClicked), null, null, 0);
+    _ = c.g_signal_connect_data(stop_btn, "clicked", @ptrCast(&onStopClicked), null, null, 0);
+    _ = c.g_signal_connect_data(win, "destroy", @ptrCast(&onDestroy), null, null, 0);
 
     refreshLabel();
-
-    // Tick every 200ms: update elapsed-time status, check auto-stop on duration.
     _ = c.g_timeout_add(200, @ptrCast(&onTick), null);
 
     c.gtk_widget_show_all(win);
@@ -227,7 +174,6 @@ pub fn run(state: *State) !void {
     widgets_global = null;
 }
 
-/// Closes window from any thread — schedules destroy on the GTK main loop.
 pub fn closeFromOtherThread() void {
     _ = c.g_idle_add(@ptrCast(&quitMainIdle), null);
 }
@@ -238,7 +184,7 @@ fn quitMainIdle(_: c.gpointer) callconv(.C) c.gboolean {
 }
 
 fn onDragPress(_: *c.GtkWidget, event: *c.GdkEventButton, user: c.gpointer) callconv(.C) c.gboolean {
-    if (event.button != 1) return @as(c.gboolean, 0); // left-click only
+    if (event.button != 1) return @as(c.gboolean, 0);
     const win: *c.GtkWidget = @ptrCast(@alignCast(user));
     c.gtk_window_begin_move_drag(
         @ptrCast(win),
@@ -251,10 +197,16 @@ fn onDragPress(_: *c.GtkWidget, event: *c.GdkEventButton, user: c.gpointer) call
 }
 
 fn onPauseClicked(_: *c.GtkButton, _: c.gpointer) callconv(.C) void {
-    if (widgets_global) |w| {
-        _ = w.state.togglePause();
-        refreshLabel();
+    const w = widgets_global orelse return;
+    const now_paused = w.state.togglePause();
+    const now_ns = std.time.nanoTimestamp();
+    if (now_paused) {
+        w.state.pause_started_ns = now_ns;
+    } else if (w.state.pause_started_ns != 0) {
+        w.state.total_paused_ns += now_ns - w.state.pause_started_ns;
+        w.state.pause_started_ns = 0;
     }
+    refreshLabel();
 }
 
 fn onMicClicked(_: *c.GtkButton, _: c.gpointer) callconv(.C) void {
@@ -284,9 +236,7 @@ fn onDestroy(_: *c.GtkWidget, _: c.gpointer) callconv(.C) void {
 fn onTick(_: c.gpointer) callconv(.C) c.gboolean {
     const w = widgets_global orelse return @as(c.gboolean, 0);
     if (w.state.duration_seconds > 0) {
-        const now = std.time.nanoTimestamp();
-        const elapsed_ns = now - w.start_ns;
-        const elapsed_s: u64 = @intCast(@divFloor(elapsed_ns, std.time.ns_per_s));
+        const elapsed_s = elapsedRecordingSeconds(w.state);
         if (elapsed_s >= w.state.duration_seconds) {
             w.state.requestStop();
             c.gtk_main_quit();
@@ -297,10 +247,23 @@ fn onTick(_: c.gpointer) callconv(.C) c.gboolean {
     return @as(c.gboolean, 1);
 }
 
+/// Wall-clock recording time minus total paused time. Used by the label
+/// and duration enforcement. Returns 0 if recording hasn't started yet.
+fn elapsedRecordingSeconds(state: *State) u64 {
+    const start = state.recording_start_ns.load(.acquire);
+    if (start == 0) return 0;
+    const now = std.time.nanoTimestamp();
+    var elapsed_ns: i128 = now - start - state.total_paused_ns;
+    if (state.pause_started_ns != 0) {
+        elapsed_ns -= now - state.pause_started_ns;
+    }
+    if (elapsed_ns < 0) elapsed_ns = 0;
+    return @intCast(@divFloor(elapsed_ns, std.time.ns_per_s));
+}
+
 fn refreshLabel() void {
     const w = widgets_global orelse return;
-    const elapsed_ns = std.time.nanoTimestamp() - w.start_ns;
-    const elapsed_s: u64 = @intCast(@divFloor(elapsed_ns, std.time.ns_per_s));
+    const elapsed_s = elapsedRecordingSeconds(w.state);
     const mm = elapsed_s / 60;
     const ss = elapsed_s % 60;
 
