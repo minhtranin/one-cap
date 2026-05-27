@@ -96,7 +96,17 @@ pub const Recorder = struct {
                     stdin.close();
                     child.stdin = null;
                 }
+                // Watchdog: Ubuntu 26 + GStreamer 1.24+ sometimes hangs in
+                // pipeline.set_state(NULL) on shutdown after a pause/resume
+                // cycle — child.wait() would block forever. Spawn a watcher
+                // that escalates SIGTERM after 4s then SIGKILL 4s later so
+                // we always return control to the user. Detached: if the
+                // child exits cleanly first, the kill returns ESRCH and the
+                // thread ends on its own.
+                const pid = child.id;
+                const watcher = std.Thread.spawn(.{}, watchdogKill, .{pid}) catch null;
                 _ = child.wait() catch {};
+                if (watcher) |t| t.detach();
             },
         }
     }
@@ -136,6 +146,22 @@ pub const Recorder = struct {
         return self.backend;
     }
 };
+
+/// Escalates child shutdown: wait 4 s, then SIGTERM; wait 4 s more, then
+/// SIGKILL. Exits early if the process is already gone (kill returns ESRCH).
+/// Runs in its own thread alongside the blocking child.wait().
+fn watchdogKill(pid: std.posix.pid_t) void {
+    const term_after_ns: u64 = 4 * std.time.ns_per_s;
+    const kill_after_ns: u64 = 4 * std.time.ns_per_s;
+
+    std.time.sleep(term_after_ns);
+    std.posix.kill(pid, std.posix.SIG.TERM) catch return;
+    std.log.warn("screen helper still alive after 4s; sent SIGTERM (pid={d})", .{pid});
+
+    std.time.sleep(kill_after_ns);
+    std.posix.kill(pid, std.posix.SIG.KILL) catch return;
+    std.log.warn("screen helper still alive after 8s; sent SIGKILL (pid={d})", .{pid});
+}
 
 /// Reads the portal helper's stdout until the PORTAL_READY marker arrives —
 /// that's the signal the GStreamer pipeline has gone PLAYING and frames are
