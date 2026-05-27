@@ -74,8 +74,8 @@ fn recordHeadless(allocator: std.mem.Allocator, opts: Options) !void {
             .channels = opts.channels,
             .source = .microphone,
         });
-        // Start paused (muted) until user toggles mic on.
-        mc.setPaused(true);
+        // Start muted (silence written, file stays wall-clock aligned with video).
+        mc.setMuted(true);
         mic_cap = mc;
         mic_file = try std.fs.cwd().createFile(tmp_mic, .{});
         mic_thread = try std.Thread.spawn(.{}, audio.captureLoop, .{ &mic_cap.?, mic_file.? });
@@ -156,7 +156,7 @@ fn recordWithUi(allocator: std.mem.Allocator, opts: Options) !void {
             .channels = opts.channels,
             .source = .microphone,
         });
-        mc.setPaused(true);
+        mc.setMuted(true);
         mic_cap = mc;
         mic_file = try std.fs.cwd().createFile(tmp_mic, .{});
         mic_thread = try std.Thread.spawn(.{}, audio.captureLoop, .{ &mic_cap.?, mic_file.? });
@@ -222,15 +222,20 @@ fn controllerLoop(
     while (!state.stop_requested.load(.acquire)) {
         const now_paused = state.isPaused();
         if (now_paused != last_paused) {
+            // Global pause: drop samples on both tracks so audio shrinks with the
+            // frozen video PTS — keeps wall-clock alignment intact across resume.
             audio_cap.setPaused(now_paused);
-            if (mic_cap) |mc| mc.setPaused(now_paused or !state.isMicEnabled());
+            if (mic_cap) |mc| mc.setPaused(now_paused);
             const cmd: []const u8 = if (now_paused) "PAUSE\n" else "RESUME\n";
             screen_rec.sendCommand(cmd) catch |e| std.log.err("send cmd failed: {}", .{e});
             last_paused = now_paused;
         }
         const now_mic = state.isMicEnabled();
         if (now_mic != last_mic) {
-            if (mic_cap) |mc| mc.setPaused(!now_mic or now_paused);
+            // Mic toggle is independent of pause: when disabled we write silence
+            // (not drop) so the mic file stays aligned to the video timeline and
+            // speech captured after the toggle lands at the correct moment.
+            if (mic_cap) |mc| mc.setMuted(!now_mic);
             last_mic = now_mic;
         }
         const now_cursor = state.isCursorEnabled();

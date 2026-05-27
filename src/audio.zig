@@ -32,6 +32,7 @@ pub const Capture = struct {
     cfg: Config,
     running: std.atomic.Value(bool),
     paused: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    muted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(cfg: Config) Error!Capture {
         var spec = c.pa_sample_spec{
@@ -105,6 +106,14 @@ pub const Capture = struct {
         return self.paused.load(.acquire);
     }
 
+    pub fn setMuted(self: *Capture, m: bool) void {
+        self.muted.store(m, .release);
+    }
+
+    pub fn isMuted(self: *Capture) bool {
+        return self.muted.load(.acquire);
+    }
+
     /// Fill buffer with raw bytes from pulse. Buffer size = fragsize works well.
     pub fn readBytes(self: *Capture, buf: []u8) Error!void {
         if (!self.running.load(.acquire)) return Error.Terminated;
@@ -117,23 +126,24 @@ pub const Capture = struct {
     }
 };
 
-/// Thread entrypoint: capture until stop flag, write all bytes to writer.
-/// While paused we still drain pulse (so the server's ring buffer doesn't
-/// back up and overrun on resume) but we DROP the samples instead of
-/// writing them. This matches what the video pipeline does: GStreamer
-/// PAUSED state freezes PTS, so when we resume, the next video frame
-/// continues from where the last one left off — video duration equals
-/// wall_clock - total_pause_time. Audio must mirror that or ffmpeg's
-/// `-shortest` mux cuts off whichever stream is longer.
+/// Thread entrypoint: capture until stop flag, write bytes to file.
 ///
-/// Earlier this loop wrote silence during pause to keep the audio file's
-/// time axis aligned with wall clock. That broke the single-track + video
-/// mux path: audio file ended up longer than video by the pause duration,
-/// so `-shortest` truncated the audio to the video length, dropping
-/// everything captured after resume.
+/// Two distinct gating modes:
+///   paused → drop samples entirely (file shrinks vs wall clock). Used when the
+///     whole recording is paused — video PTS freezes too, so the audio file
+///     and video file both shorten by the pause duration and stay aligned.
+///   muted  → write silence in place of the real samples (file keeps growing
+///     at wall-clock rate). Used for the mic track when the user has the mic
+///     toggled off but recording is otherwise live: the mic file must stay
+///     aligned to the video timeline so that when the mic is later enabled,
+///     the captured speech lands at the correct moment in the muxed output.
+///
+/// We always drain pulse on every iteration so the server's ring buffer can't
+/// back up and overrun.
 pub fn captureLoop(cap: *Capture, file: std.fs.File) void {
     const bytes_per_chunk = (cap.cfg.sample_rate * @as(u32, cap.cfg.channels) * 2 * cap.cfg.fragment_ms) / 1000;
     var buf: [16384]u8 = undefined;
+    var silence: [16384]u8 = [_]u8{0} ** 16384;
     const chunk = if (bytes_per_chunk > buf.len) buf.len else bytes_per_chunk;
 
     while (cap.isRunning()) {
@@ -142,8 +152,9 @@ pub fn captureLoop(cap: *Capture, file: std.fs.File) void {
             std.log.err("audio loop error: {}", .{e});
             break;
         };
-        if (cap.isPaused()) continue; // drained but not written
-        _ = file.writeAll(buf[0..chunk]) catch |e| {
+        if (cap.isPaused()) continue; // drained, not written — file freezes with video
+        const payload = if (cap.isMuted()) silence[0..chunk] else buf[0..chunk];
+        _ = file.writeAll(payload) catch |e| {
             std.log.err("audio file write failed: {}", .{e});
             break;
         };
