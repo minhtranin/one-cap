@@ -118,18 +118,23 @@ pub const Capture = struct {
 };
 
 /// Thread entrypoint: capture until stop flag, write all bytes to writer.
-/// While paused we drain pulse (so its ring buffer doesn't back up) and
-/// write equivalent silence to the output file. Writing silence keeps the
-/// file's time axis aligned with wall clock — required when this stream is
-/// later muxed with another audio track (e.g. mic-on-top-of-system-audio).
-/// Without it, toggling pause/unpause produces a track that's shorter than
-/// real elapsed time and ffmpeg amix plays it from t=0, producing audio
-/// drift equal to the total paused duration.
+/// While paused we still drain pulse (so the server's ring buffer doesn't
+/// back up and overrun on resume) but we DROP the samples instead of
+/// writing them. This matches what the video pipeline does: GStreamer
+/// PAUSED state freezes PTS, so when we resume, the next video frame
+/// continues from where the last one left off — video duration equals
+/// wall_clock - total_pause_time. Audio must mirror that or ffmpeg's
+/// `-shortest` mux cuts off whichever stream is longer.
+///
+/// Earlier this loop wrote silence during pause to keep the audio file's
+/// time axis aligned with wall clock. That broke the single-track + video
+/// mux path: audio file ended up longer than video by the pause duration,
+/// so `-shortest` truncated the audio to the video length, dropping
+/// everything captured after resume.
 pub fn captureLoop(cap: *Capture, file: std.fs.File) void {
     const bytes_per_chunk = (cap.cfg.sample_rate * @as(u32, cap.cfg.channels) * 2 * cap.cfg.fragment_ms) / 1000;
     var buf: [16384]u8 = undefined;
     const chunk = if (bytes_per_chunk > buf.len) buf.len else bytes_per_chunk;
-    var silence: [16384]u8 = [_]u8{0} ** 16384;
 
     while (cap.isRunning()) {
         cap.readBytes(buf[0..chunk]) catch |e| {
@@ -137,8 +142,8 @@ pub fn captureLoop(cap: *Capture, file: std.fs.File) void {
             std.log.err("audio loop error: {}", .{e});
             break;
         };
-        const payload = if (cap.isPaused()) silence[0..chunk] else buf[0..chunk];
-        _ = file.writeAll(payload) catch |e| {
+        if (cap.isPaused()) continue; // drained but not written
+        _ = file.writeAll(buf[0..chunk]) catch |e| {
             std.log.err("audio file write failed: {}", .{e});
             break;
         };
