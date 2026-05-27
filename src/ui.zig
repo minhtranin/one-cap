@@ -9,6 +9,10 @@ const c = @cImport({
     @cInclude("gtk/gtk.h");
 });
 
+// Version baked in at build time from the repo-root VERSION file via
+// build.zig (which trims + falls back to a hard-coded default if missing).
+const VERSION: []const u8 = @import("build_options").version;
+
 pub const State = struct {
     paused: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -128,7 +132,13 @@ pub fn run(state: *State) !void {
     c.gtk_container_add(@ptrCast(drag_area), drag_inner);
 
     const brand = c.gtk_label_new(null);
-    c.gtk_label_set_markup(@ptrCast(brand), "<span size='medium' foreground='#888'>onecap v27.05.26</span>");
+    var brand_buf: [128]u8 = undefined;
+    const brand_text = std.fmt.bufPrintZ(
+        &brand_buf,
+        "<span size='medium' foreground='#ccc'>onecap {s}</span>",
+        .{VERSION},
+    ) catch "onecap";
+    c.gtk_label_set_markup(@ptrCast(brand), brand_text.ptr);
     c.gtk_box_pack_start(@ptrCast(drag_inner), brand, 0, 0, 0);
 
     const status = c.gtk_label_new(null);

@@ -1,62 +1,74 @@
 # one-cap
 
-Wayland screen + audio recorder. Pure Zig + libwayland + ffmpeg. Tiny
-floating control window with cursor / mic / pause / stop toggles.
+Wayland screen + audio recorder in Zig. Floating control bar
+(cursor / mic / pause / stop). MKV+H264 by default.
 
 ![icon](packaging/one-cap.png)
 
 ## Install
 
+Two lines per distro: deps, then installer.
+
+**Arch — wlroots (niri, sway, Hyprland, wayfire, river, KDE Wayland)**
+
 ```bash
+sudo pacman -S --needed ffmpeg libpulse gtk3
 curl -fsSL https://raw.githubusercontent.com/minhtranin/one-cap/main/install.sh | bash
 ```
 
-Drops a portable AppImage in `~/.local/bin/one-cap` and registers a desktop
-entry + icon, so `one-cap` shows up in your app launcher. No sudo.
-
-Runtime deps:
+**Arch — GNOME** (adds portal + GStreamer deps)
 
 ```bash
-# Arch (wlroots: niri/sway/Hyprland/KDE)
-sudo pacman -S ffmpeg libpulse gtk3
-# Arch (GNOME — adds the portal helper deps)
-sudo pacman -S ffmpeg libpulse gtk3 python python-dbus python-gobject \
-  gst-plugins-good gst-plugin-pipewire gst-plugins-ugly
-
-# Ubuntu / Debian (works for both compositor families)
-sudo apt install ffmpeg libpulse0 libgtk-3-0 \
-  python3 python3-dbus python3-gi gir1.2-gstreamer-1.0 \
-  gstreamer1.0-plugins-good gstreamer1.0-plugins-ugly \
-  gstreamer1.0-pipewire x264
+sudo pacman -S --needed ffmpeg libpulse gtk3 python python-dbus python-gobject gst-plugins-good gst-plugin-pipewire gst-plugins-ugly
+curl -fsSL https://raw.githubusercontent.com/minhtranin/one-cap/main/install.sh | bash
 ```
 
-Supported:
-- wlroots-style compositors (niri, sway, Hyprland, wayfire, river,
-  KDE on wlroots) → in-process libwayland wlr-screencopy capture.
-- GNOME / Ubuntu Wayland → xdg-desktop-portal ScreenCast via the
-  bundled Python helper + GStreamer pipeline.
+**Ubuntu / Debian — any compositor**
+
+```bash
+sudo apt install -y ffmpeg libpulse0 libgtk-3-0 python3 python3-dbus python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-plugins-good gstreamer1.0-plugins-ugly gstreamer1.0-pipewire x264
+curl -fsSL https://raw.githubusercontent.com/minhtranin/one-cap/main/install.sh | bash
+```
+
+The installer drops a portable AppImage in `~/.local/bin/one-cap`,
+registers a `.desktop` + icon, and on GNOME also installs the bundled
+"OneCap Pin" shell extension so the control bar stays above fullscreen
+windows. Idempotent — safe to re-run for upgrades.
 
 ## Usage
 
 ```bash
-one-cap                       # record to ~/Videos/onecap-<ts>.mkv, system audio
-one-cap demo.mkv -d 10        # 10s clip
-one-cap -q medium             # quality preset: low / medium / high / ultra
+one-cap                       # ~/Videos/onecap-<ts>.mkv, system audio
+one-cap demo.mkv -d 10        # 10-second clip
+one-cap -q medium             # preset: low / medium / high / ultra
 one-cap -b 30000              # explicit 30 Mbps
 one-cap --mic                 # mic instead of system audio
-one-cap --no-ui -d 5 out.mkv  # headless, no GTK window
+one-cap --no-ui -d 5 out.mkv  # headless
 ```
 
-GUI buttons while recording: 🖱 cursor on/off, 🎤 mic on/off, ⏸ pause, ⏹ stop.
+Control bar: 🖱 cursor • 🎤 mic • ⏸ pause • ⏹ stop.
+
+## Backends
+
+| Compositor family | Backend |
+|---|---|
+| niri / sway / Hyprland / wayfire / river / KDE Wayland | in-process libwayland wlr-screencopy v3 |
+| GNOME / Ubuntu Wayland | xdg-desktop-portal ScreenCast + GStreamer (Python helper) |
+| X11 / XWayland | ffmpeg x11grab |
+| DRM (CAP_SYS_ADMIN) | ffmpeg kmsgrab |
 
 ## Build from source
 
-Zig 0.14.1 (Arch ships 0.16; install pinned version manually):
+Zig **0.14.1** required.
 
 ```bash
 zig build -Doptimize=ReleaseFast
 ./zig-out/bin/one-cap --help
 ```
+
+Version is read from the repo-root `VERSION` file by `build.zig` at
+compile time (trimmed; falls back to a hard-coded default if missing).
+Bump that file to cut a release — `ui.zig` shows it in the brand label.
 
 System build deps: `libpulse libwayland wayland-protocols wlr-protocols
 gtk3 ffmpeg x264`.
@@ -65,14 +77,15 @@ gtk3 ffmpeg x264`.
 
 ```
 main.zig
-  └─ recorder.zig         orchestrator: screen + audio + ui + mux
-       ├─ screencopy.zig         libwayland wlr-screencopy v3 capture (in-process)
-       ├─ screencopy_backend.zig pipes raw frames to ffmpeg subprocess for H264 encode
-       ├─ audio.zig              libpulse capture loop (mic + monitor)
-       └─ ui.zig                 GTK3 floating control window
+ └─ recorder.zig          orchestrator: screen + audio + ui + mux
+     ├─ screencopy.zig          libwayland wlr-screencopy v3 capture
+     ├─ screencopy_backend.zig  pipes raw frames into ffmpeg for H264
+     ├─ audio.zig               libpulse capture (mic + monitor)
+     ├─ portal_screencast.py    GNOME fallback (portal + GStreamer)
+     └─ ui.zig                  GTK3 floating control bar
 ```
 
-See [CLAUDE.md](CLAUDE.md) for full architecture + gotchas.
+See [CLAUDE.md](CLAUDE.md) for deeper notes.
 
 ## License
 

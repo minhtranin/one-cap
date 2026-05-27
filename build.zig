@@ -4,12 +4,25 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Read repo-root VERSION file at build time and expose it to the source
+    // as build_options.version. Trimmed; falls back to a hard-coded default
+    // if the file is missing or empty.
+    const version_default = "27.5.26";
+    var version_str: []const u8 = version_default;
+    if (std.fs.cwd().readFileAlloc(b.allocator, "VERSION", 64)) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len > 0) version_str = b.dupe(trimmed);
+    } else |_| {}
+    const build_opts = b.addOptions();
+    build_opts.addOption([]const u8, "version", version_str);
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+    exe_mod.addOptions("build_options", build_opts);
 
     exe_mod.linkSystemLibrary("pulse", .{});
     exe_mod.linkSystemLibrary("pulse-simple", .{});
@@ -70,6 +83,7 @@ pub fn build(b: *std.Build) void {
     test_mod.linkSystemLibrary("glib-2.0", .{});
     test_mod.linkSystemLibrary("gobject-2.0", .{});
     test_mod.linkSystemLibrary("wayland-client", .{});
+    test_mod.addOptions("build_options", build_opts);
     for (gtk_includes) |path| {
         test_mod.addIncludePath(.{ .cwd_relative = path });
     }
