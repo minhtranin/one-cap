@@ -179,6 +179,16 @@ fn recordWithUi(allocator: std.mem.Allocator, opts: Options) !void {
     };
     ctrl.join();
 
+    // If the user stopped while paused, resume the screen pipeline before
+    // shutting it down. GStreamer's PAUSED state freezes the dataflow, so
+    // an EOS sent while paused gets stuck and forces the helper's 5s safety
+    // timeout — a visible hang on Stop. Resuming first lets EOS propagate
+    // cleanly and Stop returns in well under a second.
+    if (state.isPaused()) {
+        screen_rec.sendCommand("RESUME\n") catch |e| std.log.err("pre-stop resume failed: {}", .{e});
+        std.time.sleep(50 * std.time.ns_per_ms); // let pipeline finish the PAUSED→PLAYING transition
+    }
+
     std.log.info("stopping capture...", .{});
     audio_cap.stop();
     audio_thread.join();
