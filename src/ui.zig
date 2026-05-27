@@ -18,6 +18,9 @@ pub const State = struct {
     stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     mic_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     cursor_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+    /// Playback-speed multiplier ×100 (100 = 1×, 125 = 1.25×, 150 = 1.5×, 200 = 2×).
+    /// Read once at finalize/mux time; not applied during capture.
+    speed_x100: std.atomic.Value(u32) = std.atomic.Value(u32).init(100),
 
     // Counter math. Recorder sets recording_start_ns once on launch. UI thread
     // owns pause_started_ns + total_paused_ns under the GTK main loop.
@@ -60,6 +63,14 @@ pub const State = struct {
 
     pub fn isCursorEnabled(self: *State) bool {
         return self.cursor_enabled.load(.acquire);
+    }
+
+    pub fn setSpeedX100(self: *State, v: u32) void {
+        self.speed_x100.store(v, .release);
+    }
+
+    pub fn speedX100(self: *State) u32 {
+        return self.speed_x100.load(.acquire);
     }
 };
 
@@ -144,7 +155,18 @@ pub fn run(state: *State) !void {
     c.gtk_widget_set_tooltip_text(mic_btn, "Toggle microphone");
     c.gtk_widget_set_tooltip_text(pause_btn, "Pause / Resume");
     c.gtk_widget_set_tooltip_text(stop_btn, "Stop and close");
+
+    const speed_combo = c.gtk_combo_box_text_new();
+    c.gtk_combo_box_text_append_text(@ptrCast(speed_combo), "1×");
+    c.gtk_combo_box_text_append_text(@ptrCast(speed_combo), "1.25×");
+    c.gtk_combo_box_text_append_text(@ptrCast(speed_combo), "1.5×");
+    c.gtk_combo_box_text_append_text(@ptrCast(speed_combo), "2×");
+    c.gtk_combo_box_set_active(@ptrCast(speed_combo), 0);
+    c.gtk_widget_set_size_request(speed_combo, 78, 44);
+    c.gtk_widget_set_tooltip_text(speed_combo, "Playback speed (applied on Stop)");
+
     c.gtk_box_pack_start(@ptrCast(box), cursor_btn, 0, 0, 0);
+    c.gtk_box_pack_start(@ptrCast(box), speed_combo, 0, 0, 0);
     c.gtk_box_pack_start(@ptrCast(box), mic_btn, 0, 0, 0);
     c.gtk_box_pack_start(@ptrCast(box), pause_btn, 0, 0, 0);
     c.gtk_box_pack_start(@ptrCast(box), stop_btn, 0, 0, 0);
@@ -163,6 +185,7 @@ pub fn run(state: *State) !void {
     _ = c.g_signal_connect_data(mic_btn, "clicked", @ptrCast(&onMicClicked), null, null, 0);
     _ = c.g_signal_connect_data(pause_btn, "clicked", @ptrCast(&onPauseClicked), null, null, 0);
     _ = c.g_signal_connect_data(stop_btn, "clicked", @ptrCast(&onStopClicked), null, null, 0);
+    _ = c.g_signal_connect_data(speed_combo, "changed", @ptrCast(&onSpeedChanged), null, null, 0);
     _ = c.g_signal_connect_data(win, "destroy", @ptrCast(&onDestroy), null, null, 0);
 
     refreshLabel();
@@ -181,6 +204,62 @@ pub fn closeFromOtherThread() void {
 fn quitMainIdle(_: c.gpointer) callconv(.C) c.gboolean {
     c.gtk_main_quit();
     return @as(c.gboolean, 0);
+}
+
+var finalize_done = std.atomic.Value(bool).init(false);
+var finalize_win: ?*c.GtkWidget = null;
+
+/// Show small floating "Finalizing..." dialog and enter GTK main loop. Returns
+/// when `signalFinalizeDone()` is called from another thread. Caller must call
+/// `closeFinalizing()` afterwards to destroy the window.
+pub fn runFinalizing(message: [:0]const u8) void {
+    finalize_done.store(false, .release);
+    const win = c.gtk_window_new(c.GTK_WINDOW_TOPLEVEL) orelse return;
+    finalize_win = win;
+    c.gtk_window_set_title(@ptrCast(win), "one-cap");
+    c.gtk_window_set_default_size(@ptrCast(win), 280, 80);
+    c.gtk_window_set_keep_above(@ptrCast(win), 1);
+    c.gtk_window_set_resizable(@ptrCast(win), 0);
+    c.gtk_window_set_decorated(@ptrCast(win), 0);
+    c.gtk_window_set_skip_taskbar_hint(@ptrCast(win), 1);
+    c.gtk_window_set_position(@ptrCast(win), c.GTK_WIN_POS_CENTER);
+
+    const box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 10);
+    c.gtk_widget_set_margin_top(box, 16);
+    c.gtk_widget_set_margin_bottom(box, 16);
+    c.gtk_widget_set_margin_start(box, 20);
+    c.gtk_widget_set_margin_end(box, 20);
+    c.gtk_container_add(@ptrCast(win), box);
+
+    const spinner = c.gtk_spinner_new();
+    c.gtk_spinner_start(@ptrCast(spinner));
+    c.gtk_box_pack_start(@ptrCast(box), spinner, 0, 0, 0);
+
+    const lbl = c.gtk_label_new(message.ptr);
+    c.gtk_box_pack_start(@ptrCast(box), lbl, 1, 1, 0);
+
+    c.gtk_widget_show_all(win);
+    _ = c.g_timeout_add(100, @ptrCast(&checkFinalizeDone), null);
+    c.gtk_main();
+}
+
+fn checkFinalizeDone(_: c.gpointer) callconv(.C) c.gboolean {
+    if (finalize_done.load(.acquire)) {
+        c.gtk_main_quit();
+        return @as(c.gboolean, 0);
+    }
+    return @as(c.gboolean, 1);
+}
+
+pub fn signalFinalizeDone() void {
+    finalize_done.store(true, .release);
+}
+
+pub fn closeFinalizing() void {
+    if (finalize_win) |w| {
+        c.gtk_widget_destroy(w);
+        finalize_win = null;
+    }
 }
 
 fn onDragPress(_: *c.GtkWidget, event: *c.GdkEventButton, user: c.gpointer) callconv(.C) c.gboolean {
@@ -226,6 +305,18 @@ fn onCursorClicked(_: *c.GtkButton, _: c.gpointer) callconv(.C) void {
 fn onStopClicked(_: *c.GtkButton, _: c.gpointer) callconv(.C) void {
     if (widgets_global) |w| w.state.requestStop();
     c.gtk_main_quit();
+}
+
+fn onSpeedChanged(combo: *c.GtkComboBox, _: c.gpointer) callconv(.C) void {
+    const w = widgets_global orelse return;
+    const idx = c.gtk_combo_box_get_active(combo);
+    const v: u32 = switch (idx) {
+        1 => 125,
+        2 => 150,
+        3 => 200,
+        else => 100,
+    };
+    w.state.setSpeedX100(v);
 }
 
 fn onDestroy(_: *c.GtkWidget, _: c.gpointer) callconv(.C) void {

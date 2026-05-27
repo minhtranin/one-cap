@@ -18,6 +18,9 @@ pub const Options = struct {
     sample_rate: u32 = 48000,
     channels: u8 = 2,
     show_ui: bool = true,
+    /// Initial playback-speed multiplier ×100 (100 = 1×). UI may override
+    /// before stop; mux reads the final value from state.
+    speed_x100: u32 = 100,
 };
 
 pub fn record(allocator: std.mem.Allocator, opts: Options) !void {
@@ -105,7 +108,7 @@ fn recordHeadless(allocator: std.mem.Allocator, opts: Options) !void {
 
     try screen_rec.stop();
 
-    try mux(allocator, tmp_video, tmp_audio, if (had_mic_track) tmp_mic else null, opts);
+    try mux(allocator, tmp_video, tmp_audio, if (had_mic_track) tmp_mic else null, opts, opts.speed_x100);
 
     std.log.info("done → {s}", .{opts.output_path});
 }
@@ -167,6 +170,7 @@ fn recordWithUi(allocator: std.mem.Allocator, opts: Options) !void {
     var state = ui.State{
         .duration_seconds = opts.duration_seconds orelse 0,
     };
+    state.setSpeedX100(opts.speed_x100);
     state.recording_start_ns.store(std.time.nanoTimestamp(), .release);
 
     const ctrl = try std.Thread.spawn(.{}, controllerLoop, .{
@@ -178,6 +182,8 @@ fn recordWithUi(allocator: std.mem.Allocator, opts: Options) !void {
         state.requestStop();
     };
     ctrl.join();
+
+    const final_speed_x100 = state.speedX100();
 
     // If the user stopped while paused, resume the screen pipeline before
     // shutting it down. GStreamer's PAUSED state freezes the dataflow, so
@@ -205,9 +211,45 @@ fn recordWithUi(allocator: std.mem.Allocator, opts: Options) !void {
 
     try screen_rec.stop();
 
-    try mux(allocator, tmp_video, tmp_audio, if (had_mic_track) tmp_mic else null, opts);
+    // Mux runs on a worker thread so the GTK main thread can show a small
+    // "Finalizing…" dialog with a spinner — long captures + non-1× speed used
+    // to look like the app froze on Stop.
+    var mux_ctx = MuxCtx{
+        .allocator = allocator,
+        .video_path = tmp_video,
+        .audio_path = tmp_audio,
+        .mic_path = if (had_mic_track) tmp_mic else null,
+        .opts = opts,
+        .speed_x100 = final_speed_x100,
+    };
+    const mux_thread = try std.Thread.spawn(.{}, muxThread, .{&mux_ctx});
+    const msg: [:0]const u8 = if (final_speed_x100 != 100)
+        "Finalizing video…"
+    else
+        "Saving video…";
+    ui.runFinalizing(msg);
+    mux_thread.join();
+    ui.closeFinalizing();
+    if (mux_ctx.err) |e| return e;
 
     std.log.info("done → {s}", .{opts.output_path});
+}
+
+const MuxCtx = struct {
+    allocator: std.mem.Allocator,
+    video_path: []const u8,
+    audio_path: []const u8,
+    mic_path: ?[]const u8,
+    opts: Options,
+    speed_x100: u32,
+    err: ?anyerror = null,
+};
+
+fn muxThread(ctx: *MuxCtx) void {
+    mux(ctx.allocator, ctx.video_path, ctx.audio_path, ctx.mic_path, ctx.opts, ctx.speed_x100) catch |e| {
+        ctx.err = e;
+    };
+    ui.signalFinalizeDone();
 }
 
 fn controllerLoop(
@@ -253,6 +295,7 @@ fn mux(
     audio_path: []const u8,
     mic_path: ?[]const u8,
     opts: Options,
+    speed_x100: u32,
 ) !void {
     const sr = try std.fmt.allocPrint(allocator, "{d}", .{opts.sample_rate});
     defer allocator.free(sr);
@@ -264,15 +307,77 @@ fn mux(
     else
         "aac";
 
+    const speed_active = speed_x100 != 100;
+    // Speed-up path uses `-itsscale 1/N` to rewrite input PTS in-place on the
+    // video container, then stream-copies the video bytes (no re-encode → no
+    // quality loss and finalize stays in seconds even for hour-long captures).
+    // Audio is sped via `atempo` which still requires re-encoding (cheap on raw
+    // PCM input) — without atempo the audio would shift pitch like a chipmunk.
+    const speed_n: f64 = @as(f64, @floatFromInt(speed_x100)) / 100.0;
+    const itsscale: f64 = 1.0 / speed_n;
+
     var argv = std.ArrayList([]const u8).init(allocator);
     defer argv.deinit();
-    try argv.appendSlice(&.{ "ffmpeg", "-y", "-i", video_path });
-    try argv.appendSlice(&.{ "-f", "s16le", "-ar", sr, "-ac", ch, "-i", audio_path });
 
+    // itsscale only applies to the *next* input — must come before `-i video`.
+    var itsscale_str: ?[]u8 = null;
+    defer if (itsscale_str) |s| allocator.free(s);
+    if (speed_active) {
+        itsscale_str = try std.fmt.allocPrint(allocator, "{d:.6}", .{itsscale});
+        try argv.appendSlice(&.{ "ffmpeg", "-y", "-itsscale", itsscale_str.?, "-i", video_path });
+    } else {
+        try argv.appendSlice(&.{ "ffmpeg", "-y", "-i", video_path });
+    }
+    try argv.appendSlice(&.{ "-f", "s16le", "-ar", sr, "-ac", ch, "-i", audio_path });
     if (mic_path) |mp| {
         try argv.appendSlice(&.{ "-f", "s16le", "-ar", sr, "-ac", ch, "-i", mp });
-        // Mix system (input 1) + mic (input 2). Use longest-stream duration
-        // so a paused-mic track doesn't truncate the output.
+    }
+
+    if (speed_active) {
+        const atempo_str = try std.fmt.allocPrint(allocator, "{d:.6}", .{speed_n});
+        defer allocator.free(atempo_str);
+
+        const filter = if (mic_path != null)
+            try std.fmt.allocPrint(
+                allocator,
+                "[1:a][2:a]amix=inputs=2:duration=longest:dropout_transition=0,atempo={s}[aout]",
+                .{atempo_str},
+            )
+        else
+            try std.fmt.allocPrint(
+                allocator,
+                "[1:a]atempo={s}[aout]",
+                .{atempo_str},
+            );
+        defer allocator.free(filter);
+
+        try argv.appendSlice(&.{
+            "-filter_complex", filter,
+            "-map",            "0:v",
+            "-map",            "[aout]",
+            "-c:v",            "copy",
+            "-c:a",            audio_codec,
+            "-b:a",            "192k",
+            "-shortest",
+            opts.output_path,
+        });
+
+        var child = std.process.Child.init(argv.items, allocator);
+        child.stderr_behavior = .Inherit;
+        try child.spawn();
+        const term = try child.wait();
+        switch (term) {
+            .Exited => |code| if (code != 0) {
+                std.log.err("ffmpeg mux (speed={d}) exit code {d}", .{ speed_x100, code });
+                return error.MuxFailed;
+            },
+            else => return error.MuxFailed,
+        }
+        return;
+    }
+
+    // Fast path: 1× speed → stream-copy video, encode audio only.
+    if (mic_path != null) {
         try argv.appendSlice(&.{
             "-filter_complex",
             "[1:a][2:a]amix=inputs=2:duration=longest:dropout_transition=0[aout]",
