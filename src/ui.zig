@@ -14,7 +14,11 @@ const c = @cImport({
 const VERSION: []const u8 = @import("build_options").version;
 
 pub const State = struct {
-    paused: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Set true after the user clicks Play for the first time. Capture pipelines
+    /// (screen + audio + mic) are only initialized on this transition, so a
+    /// Stop-without-Play exits cleanly without spawning ffmpeg / PulseAudio.
+    started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    paused: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     mic_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     cursor_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
@@ -43,6 +47,14 @@ pub const State = struct {
 
     pub fn isPaused(self: *State) bool {
         return self.paused.load(.acquire);
+    }
+
+    pub fn isStarted(self: *State) bool {
+        return self.started.load(.acquire);
+    }
+
+    pub fn markStarted(self: *State) void {
+        self.started.store(true, .release);
     }
 
     pub fn toggleMic(self: *State) bool {
@@ -133,9 +145,9 @@ pub fn run(state: *State) !void {
     var brand_buf: [128]u8 = undefined;
     const brand_text = std.fmt.bufPrintZ(
         &brand_buf,
-        "<span size='medium' foreground='#ccc'>onecap {s}</span>",
+        "<span size='medium' foreground='#888'>{s}</span>",
         .{VERSION},
-    ) catch "onecap";
+    ) catch "";
     c.gtk_label_set_markup(@ptrCast(brand), brand_text.ptr);
     c.gtk_box_pack_start(@ptrCast(drag_inner), brand, 0, 0, 0);
 
@@ -277,8 +289,19 @@ fn onDragPress(_: *c.GtkWidget, event: *c.GdkEventButton, user: c.gpointer) call
 
 fn onPauseClicked(_: *c.GtkButton, _: c.gpointer) callconv(.C) void {
     const w = widgets_global orelse return;
-    const now_paused = w.state.togglePause();
     const now_ns = std.time.nanoTimestamp();
+    if (!w.state.isStarted()) {
+        // First click = start capture. Mark started + un-pause + set the
+        // recording origin so the counter begins ticking.
+        w.state.markStarted();
+        w.state.paused.store(false, .release);
+        w.state.recording_start_ns.store(now_ns, .release);
+        w.state.pause_started_ns = 0;
+        w.state.total_paused_ns = 0;
+        refreshLabel();
+        return;
+    }
+    const now_paused = w.state.togglePause();
     if (now_paused) {
         w.state.pause_started_ns = now_ns;
     } else if (w.state.pause_started_ns != 0) {
@@ -326,7 +349,7 @@ fn onDestroy(_: *c.GtkWidget, _: c.gpointer) callconv(.C) void {
 
 fn onTick(_: c.gpointer) callconv(.C) c.gboolean {
     const w = widgets_global orelse return @as(c.gboolean, 0);
-    if (w.state.duration_seconds > 0) {
+    if (w.state.isStarted() and w.state.duration_seconds > 0) {
         const elapsed_s = elapsedRecordingSeconds(w.state);
         if (elapsed_s >= w.state.duration_seconds) {
             w.state.requestStop();
@@ -359,7 +382,7 @@ fn refreshLabel() void {
     const ss = elapsed_s % 60;
 
     var buf: [256]u8 = undefined;
-    const text = if (w.state.isPaused())
+    const text = if (!w.state.isStarted() or w.state.isPaused())
         std.fmt.bufPrintZ(&buf, "<span size='x-large' weight='bold' foreground='#f7c948'>⏸</span> <span size='large' foreground='#bbb'>{d:0>2}:{d:0>2}</span>", .{ mm, ss }) catch return
     else
         std.fmt.bufPrintZ(&buf, "<span size='x-large' weight='bold' foreground='#e74c3c'>●</span> <span size='large' foreground='#ccc'>{d:0>2}:{d:0>2}</span>", .{ mm, ss }) catch return;
@@ -367,7 +390,7 @@ fn refreshLabel() void {
     c.gtk_label_set_markup(@ptrCast(w.status), text.ptr);
     c.gtk_button_set_label(
         @ptrCast(w.pause_btn),
-        if (w.state.isPaused()) "▶" else "⏸",
+        if (!w.state.isStarted() or w.state.isPaused()) "▶" else "⏸",
     );
     c.gtk_button_set_label(
         @ptrCast(w.mic_btn),

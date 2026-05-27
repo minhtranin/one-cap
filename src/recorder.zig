@@ -113,112 +113,47 @@ fn recordHeadless(allocator: std.mem.Allocator, opts: Options) !void {
     std.log.info("done → {s}", .{opts.output_path});
 }
 
-/// GUI mode: capture starts immediately on launch (like the old behavior).
-/// UI window shows live counter + Pause/Stop/Mic/Cursor buttons. Counter
-/// freezes while paused. Stop closes the window and finalizes the file.
+/// GUI mode: window opens in "ready" state. Capture pipelines (screen, audio,
+/// mic) are only initialized on the first Play click — so closing the window
+/// without ever clicking Play exits cleanly with no temp files, no ffmpeg, no
+/// output. Once started, behaves like the old immediate-capture flow.
 fn recordWithUi(allocator: std.mem.Allocator, opts: Options) !void {
-    const tmp_audio = "/tmp/one-cap-audio.raw";
-    const tmp_mic = "/tmp/one-cap-mic.raw";
-    std.fs.cwd().deleteFile(tmp_audio) catch {};
-    std.fs.cwd().deleteFile(tmp_mic) catch {};
-
-    const backend = try screen.detectBackend(allocator);
-    const tmp_video = switch (backend) {
-        .wlr_screencopy, .portal_pipewire => "/tmp/one-cap-video.mkv",
-        else => "/tmp/one-cap-video.mp4",
-    };
-    std.fs.cwd().deleteFile(tmp_video) catch {};
-
-    var screen_rec = try screen.Recorder.start(allocator, .{
-        .output_path = tmp_video,
-        .framerate = opts.framerate,
-        .video_bitrate_kbps = opts.video_bitrate_kbps,
-        .backend = backend,
-    });
-    defer screen_rec.deinit();
-
-    var audio_cap = try audio.Capture.init(.{
-        .sample_rate = opts.sample_rate,
-        .channels = opts.channels,
-        .source = opts.audio_source,
-    });
-    errdefer audio_cap.deinit();
-
-    const audio_file = try std.fs.cwd().createFile(tmp_audio, .{});
-    errdefer audio_file.close();
-
-    var audio_thread = try std.Thread.spawn(.{}, audio.captureLoop, .{ &audio_cap, audio_file });
-
-    const want_mic_track = opts.audio_source == .monitor;
-    var mic_cap: ?audio.Capture = null;
-    var mic_thread: ?std.Thread = null;
-    var mic_file: ?std.fs.File = null;
-    if (want_mic_track) {
-        var mc = try audio.Capture.init(.{
-            .sample_rate = opts.sample_rate,
-            .channels = opts.channels,
-            .source = .microphone,
-        });
-        mc.setMuted(true);
-        mic_cap = mc;
-        mic_file = try std.fs.cwd().createFile(tmp_mic, .{});
-        mic_thread = try std.Thread.spawn(.{}, audio.captureLoop, .{ &mic_cap.?, mic_file.? });
-    }
-
-    std.log.info("recording... output={s}", .{opts.output_path});
-
     var state = ui.State{
         .duration_seconds = opts.duration_seconds orelse 0,
     };
     state.setSpeedX100(opts.speed_x100);
-    state.recording_start_ns.store(std.time.nanoTimestamp(), .release);
 
-    const ctrl = try std.Thread.spawn(.{}, controllerLoop, .{
-        &state, &screen_rec, &audio_cap, if (mic_cap != null) &mic_cap.? else null,
-    });
+    // Worker thread watches `state.started` and brings up the capture pipelines
+    // on the transition. Keeps GTK main on this thread.
+    var rt = RuntimeCtx{
+        .allocator = allocator,
+        .opts = opts,
+        .state = &state,
+    };
+    const starter = try std.Thread.spawn(.{}, lazyStarterThread, .{&rt});
 
     ui.run(&state) catch |e| {
         std.log.err("ui error: {} — stopping", .{e});
         state.requestStop();
     };
-    ctrl.join();
+    state.requestStop();
+    starter.join();
+
+    if (!rt.started) {
+        std.log.info("stopped without recording — no output produced", .{});
+        return;
+    }
 
     const final_speed_x100 = state.speedX100();
 
-    // If the user stopped while paused, resume the screen pipeline before
-    // shutting it down. GStreamer's PAUSED state freezes the dataflow, so
-    // an EOS sent while paused gets stuck and forces the helper's 5s safety
-    // timeout — a visible hang on Stop. Resuming first lets EOS propagate
-    // cleanly and Stop returns in well under a second.
-    if (state.isPaused()) {
-        screen_rec.sendCommand("RESUME\n") catch |e| std.log.err("pre-stop resume failed: {}", .{e});
-        std.time.sleep(50 * std.time.ns_per_ms); // let pipeline finish the PAUSED→PLAYING transition
-    }
+    // Resume before stop if paused — see comment in shutdownRuntime.
+    shutdownRuntime(&rt);
 
-    std.log.info("stopping capture...", .{});
-    audio_cap.stop();
-    audio_thread.join();
-    audio_cap.deinit();
-    audio_file.close();
-
-    const had_mic_track = mic_cap != null;
-    if (mic_cap) |*mc| {
-        mc.stop();
-        mic_thread.?.join();
-        mc.deinit();
-        if (mic_file) |mf| mf.close();
-    }
-
-    try screen_rec.stop();
-
-    // Mux runs on a worker thread so the GTK main thread can show a small
-    // "Finalizing…" dialog with a spinner — long captures + non-1× speed used
-    // to look like the app froze on Stop.
     var mux_ctx = MuxCtx{
         .allocator = allocator,
-        .video_path = tmp_video,
-        .audio_path = tmp_audio,
-        .mic_path = if (had_mic_track) tmp_mic else null,
+        .video_path = rt.tmp_video,
+        .audio_path = rt.tmp_audio,
+        .mic_path = if (rt.had_mic_track) rt.tmp_mic else null,
         .opts = opts,
         .speed_x100 = final_speed_x100,
     };
@@ -233,6 +168,125 @@ fn recordWithUi(allocator: std.mem.Allocator, opts: Options) !void {
     if (mux_ctx.err) |e| return e;
 
     std.log.info("done → {s}", .{opts.output_path});
+}
+
+const RuntimeCtx = struct {
+    allocator: std.mem.Allocator,
+    opts: Options,
+    state: *ui.State,
+
+    started: bool = false,
+    had_mic_track: bool = false,
+    tmp_audio: []const u8 = "/tmp/one-cap-audio.raw",
+    tmp_mic: []const u8 = "/tmp/one-cap-mic.raw",
+    tmp_video: []const u8 = "/tmp/one-cap-video.mkv",
+
+    screen_rec: ?screen.Recorder = null,
+    audio_cap: ?audio.Capture = null,
+    audio_file: ?std.fs.File = null,
+    audio_thread: ?std.Thread = null,
+    mic_cap: ?audio.Capture = null,
+    mic_file: ?std.fs.File = null,
+    mic_thread: ?std.Thread = null,
+    ctrl_thread: ?std.Thread = null,
+};
+
+fn lazyStarterThread(rt: *RuntimeCtx) void {
+    // Block until the user clicks Play (started=true) or closes the window
+    // (stop_requested=true). The poll is cheap and avoids needing a condition
+    // variable between GTK and the recorder.
+    while (true) {
+        if (rt.state.stop_requested.load(.acquire)) return;
+        if (rt.state.isStarted()) break;
+        std.time.sleep(50 * std.time.ns_per_ms);
+    }
+
+    bringUpRuntime(rt) catch |e| {
+        std.log.err("startup failed: {} — aborting", .{e});
+        rt.state.requestStop();
+        return;
+    };
+    rt.started = true;
+}
+
+fn bringUpRuntime(rt: *RuntimeCtx) !void {
+    std.fs.cwd().deleteFile(rt.tmp_audio) catch {};
+    std.fs.cwd().deleteFile(rt.tmp_mic) catch {};
+
+    const backend = try screen.detectBackend(rt.allocator);
+    rt.tmp_video = switch (backend) {
+        .wlr_screencopy, .portal_pipewire => "/tmp/one-cap-video.mkv",
+        else => "/tmp/one-cap-video.mp4",
+    };
+    std.fs.cwd().deleteFile(rt.tmp_video) catch {};
+
+    rt.screen_rec = try screen.Recorder.start(rt.allocator, .{
+        .output_path = rt.tmp_video,
+        .framerate = rt.opts.framerate,
+        .video_bitrate_kbps = rt.opts.video_bitrate_kbps,
+        .backend = backend,
+    });
+
+    rt.audio_cap = try audio.Capture.init(.{
+        .sample_rate = rt.opts.sample_rate,
+        .channels = rt.opts.channels,
+        .source = rt.opts.audio_source,
+    });
+    rt.audio_file = try std.fs.cwd().createFile(rt.tmp_audio, .{});
+    rt.audio_thread = try std.Thread.spawn(.{}, audio.captureLoop, .{ &rt.audio_cap.?, rt.audio_file.? });
+
+    const want_mic_track = rt.opts.audio_source == .monitor;
+    if (want_mic_track) {
+        var mc = try audio.Capture.init(.{
+            .sample_rate = rt.opts.sample_rate,
+            .channels = rt.opts.channels,
+            .source = .microphone,
+        });
+        mc.setMuted(true);
+        rt.mic_cap = mc;
+        rt.mic_file = try std.fs.cwd().createFile(rt.tmp_mic, .{});
+        rt.mic_thread = try std.Thread.spawn(.{}, audio.captureLoop, .{ &rt.mic_cap.?, rt.mic_file.? });
+        rt.had_mic_track = true;
+    }
+
+    std.log.info("recording... output={s}", .{rt.opts.output_path});
+
+    rt.ctrl_thread = try std.Thread.spawn(.{}, controllerLoop, .{
+        rt.state,
+        &rt.screen_rec.?,
+        &rt.audio_cap.?,
+        if (rt.mic_cap != null) &rt.mic_cap.? else null,
+    });
+}
+
+fn shutdownRuntime(rt: *RuntimeCtx) void {
+    if (rt.ctrl_thread) |t| t.join();
+    rt.ctrl_thread = null;
+
+    // Resume before stop if paused — GStreamer PAUSED freezes dataflow and an
+    // EOS sent while paused gets stuck until the helper's 5s watchdog.
+    if (rt.state.isPaused()) {
+        if (rt.screen_rec) |*sr| sr.sendCommand("RESUME\n") catch |e| std.log.err("pre-stop resume failed: {}", .{e});
+        std.time.sleep(50 * std.time.ns_per_ms);
+    }
+
+    std.log.info("stopping capture...", .{});
+    if (rt.audio_cap) |*ac| ac.stop();
+    if (rt.audio_thread) |t| t.join();
+    if (rt.audio_cap) |*ac| ac.deinit();
+    if (rt.audio_file) |f| f.close();
+
+    if (rt.mic_cap) |*mc| {
+        mc.stop();
+        if (rt.mic_thread) |t| t.join();
+        mc.deinit();
+        if (rt.mic_file) |f| f.close();
+    }
+
+    if (rt.screen_rec) |*sr| {
+        sr.stop() catch |e| std.log.err("screen stop failed: {}", .{e});
+        sr.deinit();
+    }
 }
 
 const MuxCtx = struct {
