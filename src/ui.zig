@@ -28,9 +28,9 @@ pub const State = struct {
 
     // Counter math. Recorder sets recording_start_ns once on launch. UI thread
     // owns pause_started_ns + total_paused_ns under the GTK main loop.
-    recording_start_ns: std.atomic.Value(i128) = std.atomic.Value(i128).init(0),
-    pause_started_ns: i128 = 0,
-    total_paused_ns: i128 = 0,
+    recording_start_ns: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    pause_started_ns: i64 = 0,
+    total_paused_ns: i64 = 0,
 
     // 0 = open-ended.
     duration_seconds: u32 = 0,
@@ -289,7 +289,7 @@ fn onDragPress(_: *c.GtkWidget, event: *c.GdkEventButton, user: c.gpointer) call
 
 fn onPauseClicked(_: *c.GtkButton, _: c.gpointer) callconv(.C) void {
     const w = widgets_global orelse return;
-    const now_ns = std.time.nanoTimestamp();
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
     if (!w.state.isStarted()) {
         // First click = start capture. Mark started + un-pause + set the
         // recording origin so the counter begins ticking.
@@ -366,8 +366,8 @@ fn onTick(_: c.gpointer) callconv(.C) c.gboolean {
 fn elapsedRecordingSeconds(state: *State) u64 {
     const start = state.recording_start_ns.load(.acquire);
     if (start == 0) return 0;
-    const now = std.time.nanoTimestamp();
-    var elapsed_ns: i128 = now - start - state.total_paused_ns;
+    const now: i64 = @intCast(std.time.nanoTimestamp());
+    var elapsed_ns: i64 = now - start - state.total_paused_ns;
     if (state.pause_started_ns != 0) {
         elapsed_ns -= now - state.pause_started_ns;
     }
