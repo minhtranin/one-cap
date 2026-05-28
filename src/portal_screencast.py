@@ -83,7 +83,11 @@ def main():
         handle_response(select_token, lambda r: start_session(session_handle))
         screencast.SelectSources(session_handle, {
             "handle_token": select_token,
-            "types": dbus.UInt32(1),         # 1 = MONITOR
+            # Bitmask: 1=MONITOR | 2=WINDOW. Portal dialog shows tabs for
+            # both — user picks fullscreen monitor or single window. Region
+            # selection on GNOME comes via the Monitor tab's built-in
+            # selection mode (no separate types flag).
+            "types": dbus.UInt32(1 | 2),
             "multiple": False,
             "cursor_mode": dbus.UInt32(2),   # 2 = embedded
         })
