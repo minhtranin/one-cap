@@ -1,9 +1,11 @@
+<p align="center">
+  <img src="packaging/one-cap.png" alt="one-cap" width="180" />
+</p>
+
 # one-cap
 
 Wayland screen + audio recorder in Zig. Floating control bar
 (cursor / mic / pause / stop). MKV+H264 by default.
-
-![icon](packaging/one-cap.png)
 
 ## Install
 
