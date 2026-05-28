@@ -68,7 +68,7 @@ jobs:
 
       # --- build ----------------------------------------------------------
       - name: Build (ReleaseFast)
-        run: zig build -Doptimize=ReleaseFast
+        run: zig build -Doptimize=ReleaseFast -Dcpu=baseline
 
       # --- raw-binary smoke test ----------------------------------------
       # Run the freshly built ./zig-out/bin/one-cap directly (before
