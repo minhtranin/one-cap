@@ -76,6 +76,85 @@ case ":$PATH:" in
     *) log "note: $BIN_DIR is not on \$PATH; add it to your shell rc to run 'one-cap' from a terminal." ;;
 esac
 
+# --- GNOME-only: install + enable the OneCap Pin shell extension. --------
+# Mutter ignores `gtk_window_set_keep_above` over fullscreen apps, so the
+# control bar disappears when a fullscreen window covers it. The tiny
+# bundled GNOME Shell extension re-raises the bar on every restack /
+# fullscreen change so it stays visible.
+#
+# Skipped on niri / Hyprland / sway / wayfire / river / KDE — those
+# compositors already honor keep_above + an extension would be dead code.
+is_gnome_session() {
+    local d="${XDG_CURRENT_DESKTOP:-}${XDG_SESSION_DESKTOP:-}"
+    case "${d,,}" in
+        *gnome*|*unity*|*ubuntu*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+install_gnome_extension() {
+    # Runs only on GNOME. All steps idempotent — safe to re-run after every
+    # install/upgrade. Extension files just get overwritten with the latest
+    # version; gnome-extensions enable is a no-op if already enabled.
+    local EXT_UUID="onecap-pin@local"
+    local EXT_DIR="$HOME/.local/share/gnome-shell/extensions/$EXT_UUID"
+    local EXT_BASE
+    if [[ "$VERSION" == "latest" ]]; then
+        EXT_BASE="https://raw.githubusercontent.com/$REPO/main/extras/gnome-shell-extension/$EXT_UUID"
+    else
+        EXT_BASE="https://raw.githubusercontent.com/$REPO/$VERSION/extras/gnome-shell-extension/$EXT_UUID"
+    fi
+    log "GNOME detected → installing/refreshing $EXT_UUID extension"
+    mkdir -p "$EXT_DIR"
+    # Download to temp first, then move into place atomically. Avoids leaving
+    # a half-written extension.js if the second curl fails on a flaky network.
+    local tmp_meta tmp_ext
+    tmp_meta=$(mktemp) || return 0
+    tmp_ext=$(mktemp)  || { rm -f "$tmp_meta"; return 0; }
+    if ! curl -fsSL -o "$tmp_meta" "$EXT_BASE/metadata.json" \
+        || ! curl -fsSL -o "$tmp_ext"  "$EXT_BASE/extension.js"; then
+        rm -f "$tmp_meta" "$tmp_ext"
+        log "warn: could not download $EXT_UUID files; skipping (main install OK)"
+        return 0
+    fi
+    mv -f "$tmp_meta" "$EXT_DIR/metadata.json"
+    mv -f "$tmp_ext"  "$EXT_DIR/extension.js"
+
+    # Try to enable now. gnome-shell may not have rescanned the extensions
+    # dir yet (Wayland sessions can't restart shell without logout), so this
+    # often returns "extension does not exist" on first install. The user
+    # then re-runs after logout. Either way: never abort.
+    if command -v gnome-extensions >/dev/null 2>&1; then
+        # Detect re-install: extension already known to gnome-shell. The new
+        # extension.js sits on disk but the running shell still has the OLD
+        # one loaded — needs a session restart to swap in fresh code.
+        local was_known=0
+        if gnome-extensions info "$EXT_UUID" >/dev/null 2>&1; then
+            was_known=1
+        fi
+
+        if gnome-extensions enable "$EXT_UUID" 2>/dev/null; then
+            if [[ "$was_known" == "1" ]]; then
+                log "$EXT_UUID re-installed (old code still loaded; log out + back in to pick up the new version)"
+            else
+                log "$EXT_UUID enabled"
+            fi
+        else
+            log "$EXT_UUID files staged; log out + back in once, then run:"
+            log "  gnome-extensions enable $EXT_UUID"
+        fi
+    fi
+}
+
+# Wrap in a guard so a non-zero return from anything inside cannot kill the
+# whole script (we're under `set -e`). niri / Hyprland / sway / wayfire /
+# river / KDE never enter this branch — they already honor keep_above.
+if is_gnome_session; then
+    install_gnome_extension || true
+else
+    log "non-GNOME session → skipping GNOME Shell extension (not needed here)"
+fi
+# -------------------------------------------------------------------------
 
 log "done. launch 'one-cap' from your app menu, or run: $BIN_DIR/one-cap --help"
 log "you also need ffmpeg, libpulse, libgtk-3, and a Wayland compositor that advertises wlr-screencopy"
