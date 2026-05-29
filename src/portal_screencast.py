@@ -110,10 +110,10 @@ def main():
         screencast.Start(session_handle, "", {"handle_token": start_token})
 
     def launch_pipeline(fd, node_id):
-        # Matroska container handles abrupt close better than mp4.
         # Container picked by extension:
         #   .webm → VP8 (sw) — only choice for true WebM, slower
-        #   .mkv  → x264 ultrafast (sw) — much faster, no frame drops at 1440p30
+        #   .mkv  → x264 ultrafast + matroskamux — crash-tolerant
+        #   .mp4  → x264 ultrafast + fragmented mp4mux — crash-tolerant + universal playback
         target_bps = bitrate_kbps * 1000
         if out_path.endswith(".webm"):
             enc = (
@@ -121,6 +121,17 @@ def main():
                 f"end-usage=vbr target-bitrate={target_bps} "
                 f"keyframe-max-dist={framerate * 3} "
                 f"! webmmux streamable=true"
+            )
+        elif out_path.endswith(".mp4"):
+            # fragment-duration (ms) makes mp4mux emit a fragmented stream,
+            # safe to truncate (kill/crash mid-record still leaves a playable
+            # file up to the last fragment).
+            enc = (
+                f"x264enc speed-preset=ultrafast tune=zerolatency "
+                f"bitrate={bitrate_kbps} key-int-max={framerate * 3} "
+                f"byte-stream=true threads=0 "
+                f"! h264parse "
+                f"! mp4mux fragment-duration=1000 streamable=true"
             )
         else:
             enc = (

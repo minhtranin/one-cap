@@ -57,6 +57,10 @@ pub const Backend = struct {
         );
         defer allocator.free(crop_str);
 
+        // Fragmented mp4 (+frag_keyframe+empty_moov+default_base_moof) writes a
+        // moov header upfront and a moof per keyframe, so a kill/crash mid-record
+        // leaves a file that's playable up to the last completed fragment. Plain
+        // mp4 would only write moov at finalize → crash = unplayable.
         const argv = [_][]const u8{
             "ffmpeg",            "-y",
             "-f",                "rawvideo",
@@ -70,6 +74,7 @@ pub const Backend = struct {
             "-tune",             "zerolatency",
             "-pix_fmt",          "yuv420p",
             "-b:v",              br_str,
+            "-movflags",         "+frag_keyframe+empty_moov+default_base_moof",
             cfg.output_path,
         };
 

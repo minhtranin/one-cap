@@ -27,8 +27,8 @@ pub const Backend = enum {
 
     pub fn extension(self: Backend) []const u8 {
         return switch (self) {
-            .wlr_screencopy, .portal_pipewire => "mkv",
-            else => "mp4",
+            .wlr_screencopy, .portal_pipewire, .ffmpeg_x11grab, .ffmpeg_kmsgrab => "mp4",
+            .wf_recorder => "mp4",
         };
     }
 };

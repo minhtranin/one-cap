@@ -37,10 +37,7 @@ fn recordHeadless(allocator: std.mem.Allocator, opts: Options) !void {
     std.fs.cwd().deleteFile(tmp_mic) catch {};
 
     const backend = try screen.detectBackend(allocator);
-    const tmp_video = switch (backend) {
-        .wlr_screencopy, .portal_pipewire => "/tmp/one-cap-video.mkv",
-        else => "/tmp/one-cap-video.mp4",
-    };
+    const tmp_video = "/tmp/one-cap-video.mp4";
     std.fs.cwd().deleteFile(tmp_video) catch {};
 
     var screen_rec = try screen.Recorder.start(allocator, .{
@@ -179,7 +176,7 @@ const RuntimeCtx = struct {
     had_mic_track: bool = false,
     tmp_audio: []const u8 = "/tmp/one-cap-audio.raw",
     tmp_mic: []const u8 = "/tmp/one-cap-mic.raw",
-    tmp_video: []const u8 = "/tmp/one-cap-video.mkv",
+    tmp_video: []const u8 = "/tmp/one-cap-video.mp4",
 
     screen_rec: ?screen.Recorder = null,
     audio_cap: ?audio.Capture = null,
@@ -214,10 +211,7 @@ fn bringUpRuntime(rt: *RuntimeCtx) !void {
     std.fs.cwd().deleteFile(rt.tmp_mic) catch {};
 
     const backend = try screen.detectBackend(rt.allocator);
-    rt.tmp_video = switch (backend) {
-        .wlr_screencopy, .portal_pipewire => "/tmp/one-cap-video.mkv",
-        else => "/tmp/one-cap-video.mp4",
-    };
+    rt.tmp_video = "/tmp/one-cap-video.mp4";
     std.fs.cwd().deleteFile(rt.tmp_video) catch {};
 
     rt.screen_rec = try screen.Recorder.start(rt.allocator, .{
