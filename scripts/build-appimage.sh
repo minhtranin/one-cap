@@ -23,12 +23,6 @@ mkdir -p "$APPDIR/usr/bin"
 
 cp "$BIN" "$APPDIR/usr/bin/one-cap"
 
-# Bundle the GNOME/portal screen-capture helper next to the binary.
-# screen.zig's findPortalHelper() looks for a sibling portal_screencast.py
-# first, so this path resolves before any system fallback.
-cp src/portal_screencast.py "$APPDIR/usr/bin/portal_screencast.py"
-chmod +x "$APPDIR/usr/bin/portal_screencast.py"
-
 # NOTE: ffmpeg is a runtime dep, but bundling it pulls in 60+ transitive
 # shared libs (libplacebo, libass, libva, libvpl, libmysofa, libflite_*,
 # libopenmpt, ...) ballooning the AppImage to ~150MB and slowing builds
@@ -50,6 +44,10 @@ export DEPLOY_GTK_VERSION=3
 # AppImages get squashfs-compressed anyway so size cost is minimal.
 export NO_STRIP=1
 
+# libpipewire is excluded: it dlopens SPA plugins from the host's
+# /usr/lib/*/spa-0.2, so a bundled copy would run against mismatched plugins.
+# Every desktop with screen-cast support already ships it.
+
 # Bake the icon's mime entry so the AppImage shows the sheep, not a generic
 # wrench, in app launchers.
 linuxdeploy \
@@ -58,6 +56,7 @@ linuxdeploy \
     --desktop-file packaging/one-cap.desktop \
     --icon-file packaging/one-cap.png \
     --plugin gtk \
+    --exclude-library 'libpipewire-0.3.so*' \
     --output appimage
 
 # linuxdeploy writes one-cap-x86_64.AppImage in the cwd. Rename for clarity.

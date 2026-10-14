@@ -8,6 +8,7 @@ const std = @import("std");
 const audio = @import("audio.zig");
 const screen = @import("screen.zig");
 const ui = @import("ui.zig");
+const encoder = @import("encoder.zig");
 
 pub const Options = struct {
     output_path: []const u8,
@@ -18,6 +19,9 @@ pub const Options = struct {
     sample_rate: u32 = 48000,
     channels: u8 = 2,
     show_ui: bool = true,
+    /// GUI mode: show the drag-to-select overlay before the control bar.
+    select_area: bool = true,
+    region: ?encoder.Region = null,
     /// Initial playback-speed multiplier ×100 (100 = 1×). UI may override
     /// before stop; mux reads the final value from state.
     speed_x100: u32 = 100,
@@ -84,7 +88,7 @@ fn recordHeadless(allocator: std.mem.Allocator, opts: Options) !void {
     std.log.info("recording (headless)... output={s}", .{opts.output_path});
 
     if (opts.duration_seconds) |secs| {
-        std.time.sleep(@as(u64, secs) * std.time.ns_per_s);
+        std.Thread.sleep(@as(u64, secs) * std.time.ns_per_s);
     } else {
         try waitForInterrupt();
     }
@@ -114,11 +118,33 @@ fn recordHeadless(allocator: std.mem.Allocator, opts: Options) !void {
 /// mic) are only initialized on the first Play click — so closing the window
 /// without ever clicking Play exits cleanly with no temp files, no ffmpeg, no
 /// output. Once started, behaves like the old immediate-capture flow.
-fn recordWithUi(allocator: std.mem.Allocator, opts: Options) !void {
+fn recordWithUi(allocator: std.mem.Allocator, opts_in: Options) !void {
+    var opts = opts_in;
+    if (opts.select_area) {
+        const backend = screen.detectBackend(allocator) catch .wlr_screencopy;
+        const still = screen.grabStill(allocator, backend);
+        defer if (still) |st| st.deinit();
+        switch (try ui.selectRegion(if (still) |*st| st else null)) {
+            .cancelled => {
+                std.log.info("area selection cancelled", .{});
+                return;
+            },
+            .full => {},
+            .region => |r| {
+                std.log.info("area: {d}x{d}+{d}+{d} (monitor {d})", .{ r.w, r.h, r.x, r.y, r.monitor_index });
+                opts.region = r;
+            },
+        }
+    }
+
     var state = ui.State{
         .duration_seconds = opts.duration_seconds orelse 0,
+        .cursor_toggle = (screen.detectBackend(allocator) catch .wlr_screencopy) != .portal_pipewire,
     };
     state.setSpeedX100(opts.speed_x100);
+    // Recording starts right away (after the area picker, if shown).
+    state.markStarted();
+    state.paused.store(false, .release);
 
     // Worker thread watches `state.started` and brings up the capture pipelines
     // on the transition. Keeps GTK main on this thread.
@@ -143,7 +169,6 @@ fn recordWithUi(allocator: std.mem.Allocator, opts: Options) !void {
 
     const final_speed_x100 = state.speedX100();
 
-    // Resume before stop if paused — see comment in shutdownRuntime.
     shutdownRuntime(&rt);
 
     var mux_ctx = MuxCtx{
@@ -195,15 +220,17 @@ fn lazyStarterThread(rt: *RuntimeCtx) void {
     while (true) {
         if (rt.state.stop_requested.load(.acquire)) return;
         if (rt.state.isStarted()) break;
-        std.time.sleep(50 * std.time.ns_per_ms);
+        std.Thread.sleep(50 * std.time.ns_per_ms);
     }
 
     bringUpRuntime(rt) catch |e| {
-        std.log.err("startup failed: {} — aborting", .{e});
+        std.log.err("startup failed: {t} — aborting", .{e});
         rt.state.requestStop();
         return;
     };
     rt.started = true;
+    if (rt.state.recording_start_ns.load(.acquire) == 0)
+        rt.state.recording_start_ns.store(@intCast(std.time.nanoTimestamp()), .release);
 }
 
 fn bringUpRuntime(rt: *RuntimeCtx) !void {
@@ -219,6 +246,7 @@ fn bringUpRuntime(rt: *RuntimeCtx) !void {
         .framerate = rt.opts.framerate,
         .video_bitrate_kbps = rt.opts.video_bitrate_kbps,
         .backend = backend,
+        .region = rt.opts.region,
     });
 
     rt.audio_cap = try audio.Capture.init(.{
@@ -256,13 +284,6 @@ fn bringUpRuntime(rt: *RuntimeCtx) !void {
 fn shutdownRuntime(rt: *RuntimeCtx) void {
     if (rt.ctrl_thread) |t| t.join();
     rt.ctrl_thread = null;
-
-    // Resume before stop if paused — GStreamer PAUSED freezes dataflow and an
-    // EOS sent while paused gets stuck until the helper's 5s watchdog.
-    if (rt.state.isPaused()) {
-        if (rt.screen_rec) |*sr| sr.sendCommand("RESUME\n") catch |e| std.log.err("pre-stop resume failed: {}", .{e});
-        std.time.sleep(50 * std.time.ns_per_ms);
-    }
 
     std.log.info("stopping capture...", .{});
     if (rt.audio_cap) |*ac| ac.stop();
@@ -333,7 +354,7 @@ fn controllerLoop(
             screen_rec.setShowCursor(now_cursor);
             last_cursor = now_cursor;
         }
-        std.time.sleep(100 * std.time.ns_per_ms);
+        std.Thread.sleep(100 * std.time.ns_per_ms);
     }
 }
 
@@ -364,7 +385,7 @@ fn mux(
     const speed_n: f64 = @as(f64, @floatFromInt(speed_x100)) / 100.0;
     const itsscale: f64 = 1.0 / speed_n;
 
-    var argv = std.ArrayList([]const u8).init(allocator);
+    var argv = std.array_list.Managed([]const u8).init(allocator);
     defer argv.deinit();
 
     // itsscale only applies to the *next* input — must come before `-i video`.
@@ -460,19 +481,19 @@ fn mux(
 
 var interrupted = std.atomic.Value(bool).init(false);
 
-fn sigintHandler(_: c_int) callconv(.C) void {
+fn sigintHandler(_: c_int) callconv(.c) void {
     interrupted.store(true, .release);
 }
 
 fn waitForInterrupt() !void {
     const act = std.posix.Sigaction{
         .handler = .{ .handler = sigintHandler },
-        .mask = std.posix.empty_sigset,
+        .mask = std.posix.sigemptyset(),
         .flags = 0,
     };
     std.posix.sigaction(std.posix.SIG.INT, &act, null);
 
     while (!interrupted.load(.acquire)) {
-        std.time.sleep(100 * std.time.ns_per_ms);
+        std.Thread.sleep(100 * std.time.ns_per_ms);
     }
 }

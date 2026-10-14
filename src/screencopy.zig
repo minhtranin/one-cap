@@ -34,6 +34,9 @@ pub const Error = error{
     Terminated,
 };
 
+pub const format_xrgb8888: u32 = c.WL_SHM_FORMAT_XRGB8888;
+pub const format_argb8888: u32 = c.WL_SHM_FORMAT_ARGB8888;
+
 pub const Frame = struct {
     width: u32,
     height: u32,
@@ -262,7 +265,7 @@ fn onGlobal(
     name: u32,
     interface: [*c]const u8,
     version: u32,
-) callconv(.C) void {
+) callconv(.c) void {
     const s: *State = @ptrCast(@alignCast(data));
     const iface = std.mem.span(interface);
 
@@ -278,7 +281,7 @@ fn onGlobal(
     }
 }
 
-fn onGlobalRemove(_: ?*anyopaque, _: ?*c.wl_registry, _: u32) callconv(.C) void {}
+fn onGlobalRemove(_: ?*anyopaque, _: ?*c.wl_registry, _: u32) callconv(.c) void {}
 
 // --- frame handlers ---
 
@@ -289,7 +292,7 @@ fn onFrameBuffer(
     width: u32,
     height: u32,
     stride: u32,
-) callconv(.C) void {
+) callconv(.c) void {
     const s: *State = @ptrCast(@alignCast(data));
     s.info = .{ .width = width, .height = height, .stride = stride, .format = format };
 }
@@ -297,7 +300,7 @@ fn onFrameBuffer(
 fn onFrameBufferDone(
     data: ?*anyopaque,
     _: ?*c.zwlr_screencopy_frame_v1,
-) callconv(.C) void {
+) callconv(.c) void {
     const s: *State = @ptrCast(@alignCast(data));
     s.got_buffer = true;
 }
@@ -308,7 +311,7 @@ fn onFrameLinuxDmabuf(
     _: u32,
     _: u32,
     _: u32,
-) callconv(.C) void {}
+) callconv(.c) void {}
 
 fn onFrameDamage(
     _: ?*anyopaque,
@@ -317,13 +320,13 @@ fn onFrameDamage(
     _: u32,
     _: u32,
     _: u32,
-) callconv(.C) void {}
+) callconv(.c) void {}
 
 fn onFrameFlags(
     _: ?*anyopaque,
     _: ?*c.zwlr_screencopy_frame_v1,
     _: u32,
-) callconv(.C) void {}
+) callconv(.c) void {}
 
 fn onFrameReady(
     data: ?*anyopaque,
@@ -331,7 +334,7 @@ fn onFrameReady(
     _: u32,
     _: u32,
     _: u32,
-) callconv(.C) void {
+) callconv(.c) void {
     const s: *State = @ptrCast(@alignCast(data));
     s.got_ready = true;
 }
@@ -339,7 +342,7 @@ fn onFrameReady(
 fn onFrameFailed(
     data: ?*anyopaque,
     _: ?*c.zwlr_screencopy_frame_v1,
-) callconv(.C) void {
+) callconv(.c) void {
     const s: *State = @ptrCast(@alignCast(data));
     s.failed = true;
 }
@@ -363,7 +366,7 @@ pub fn captureLoop(cap: *Capture, file: std.fs.File) void {
     while (cap.isRunning()) {
         next_ns += @intCast(frame_ns);
         if (cap.isPaused()) {
-            std.time.sleep(@intCast(@max(frame_ns, 16_000_000)));
+            std.Thread.sleep(@intCast(@max(frame_ns, 16_000_000)));
             next_ns = std.time.nanoTimestamp();
             continue;
         }
@@ -373,7 +376,7 @@ pub fn captureLoop(cap: *Capture, file: std.fs.File) void {
         };
         const now = std.time.nanoTimestamp();
         if (now < next_ns) {
-            std.time.sleep(@intCast(next_ns - now));
+            std.Thread.sleep(@intCast(next_ns - now));
         } else {
             next_ns = now;
         }

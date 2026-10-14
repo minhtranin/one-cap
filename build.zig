@@ -31,6 +31,8 @@ pub fn build(b: *std.Build) void {
     exe_mod.linkSystemLibrary("glib-2.0", .{});
     exe_mod.linkSystemLibrary("gobject-2.0", .{});
     exe_mod.linkSystemLibrary("wayland-client", .{});
+    exe_mod.linkSystemLibrary("gio-2.0", .{});
+    exe_mod.linkSystemLibrary("libpipewire-0.3", .{});
 
     const gtk_includes = [_][]const u8{
         "/usr/include/gtk-3.0",
@@ -44,6 +46,9 @@ pub fn build(b: *std.Build) void {
         "/usr/include/libpng16",
         "/usr/include/gdk-pixbuf-2.0",
         "/usr/include/atk-1.0",
+        "/usr/include/gio-unix-2.0",
+        "/usr/include/pipewire-0.3",
+        "/usr/include/spa-0.2",
     };
     for (gtk_includes) |path| {
         exe_mod.addIncludePath(.{ .cwd_relative = path });
@@ -83,6 +88,8 @@ pub fn build(b: *std.Build) void {
     test_mod.linkSystemLibrary("glib-2.0", .{});
     test_mod.linkSystemLibrary("gobject-2.0", .{});
     test_mod.linkSystemLibrary("wayland-client", .{});
+    test_mod.linkSystemLibrary("gio-2.0", .{});
+    test_mod.linkSystemLibrary("libpipewire-0.3", .{});
     test_mod.addOptions("build_options", build_opts);
     for (gtk_includes) |path| {
         test_mod.addIncludePath(.{ .cwd_relative = path });

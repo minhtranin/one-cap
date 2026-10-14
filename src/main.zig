@@ -24,6 +24,7 @@ const usage =
     \\    -q, --quality <name>    Preset: low (8M) | medium (15M) | high (25M) | ultra (40M)
     \\        --mic               Capture microphone instead of system audio
     \\        --monitor           Capture system audio (default — explicit override)
+    \\        --full              Skip the area picker, record the whole screen
     \\    -h, --help              Print this help
     \\
     \\EXAMPLES:
@@ -53,7 +54,7 @@ pub fn main() !void {
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
-            try std.io.getStdOut().writer().writeAll(usage);
+            try std.fs.File.stdout().writeAll(usage);
             return;
         } else if (std.mem.eql(u8, a, "-d") or std.mem.eql(u8, a, "--duration")) {
             i += 1;
@@ -85,6 +86,8 @@ pub fn main() !void {
             opts.audio_source = .monitor;
         } else if (std.mem.eql(u8, a, "--mic")) {
             opts.audio_source = .microphone;
+        } else if (std.mem.eql(u8, a, "--full")) {
+            opts.select_area = false;
         } else if (std.mem.eql(u8, a, "--no-ui")) {
             opts.show_ui = false;
         } else if (a.len > 0 and a[0] == '-') {
@@ -134,4 +137,6 @@ fn defaultOutputPath(allocator: std.mem.Allocator) ![]u8 {
 test "compile audio module" {
     _ = audio;
     _ = recorder;
+    _ = @import("encoder.zig");
+    _ = @import("pipewire_capture.zig");
 }

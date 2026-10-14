@@ -18,10 +18,10 @@ jobs:
     name: Build AppImage and smoke-test under headless sway
     runs-on: ubuntu-24.04
     env:
-      ZIG_VERSION: 0.14.1
+      ZIG_VERSION: 0.15.2
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # --- toolchain + system deps ---------------------------------------
       - name: Install build/runtime apt packages
@@ -31,7 +31,7 @@ jobs:
             build-essential pkg-config curl ca-certificates xz-utils \
             libpulse-dev pulseaudio pulseaudio-utils \
             libwayland-dev wayland-protocols \
-            libgtk-3-dev libglib2.0-dev \
+            libgtk-3-dev libglib2.0-dev libpipewire-0.3-dev \
             libx264-dev ffmpeg \
             sway xwayland xvfb dbus-x11 mesa-utils \
             libfuse2 file desktop-file-utils
@@ -232,7 +232,7 @@ jobs:
 
       # --- artifacts ------------------------------------------------------
       - name: Upload AppImage artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: one-cap-AppImage
           path: ${{ steps.appimage.outputs.path }}
@@ -240,7 +240,7 @@ jobs:
 
       - name: Upload smoke test recording for inspection
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: smoke-test-recording
           path: |
@@ -255,7 +255,7 @@ jobs:
       # --- release on tag -------------------------------------------------
       - name: Attach AppImage to GitHub release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: ${{ steps.appimage.outputs.path }}
           generate_release_notes: true

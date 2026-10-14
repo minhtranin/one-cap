@@ -1,14 +1,15 @@
 //! Wlr-screencopy backend: in-process Wayland capture thread feeding raw
-//! frames to an ffmpeg subprocess via stdin. Replaces the python+gstreamer
-//! portal helper on niri / wlroots.
+//! frames to an ffmpeg subprocess via stdin (niri / wlroots).
 
 const std = @import("std");
 const screencopy = @import("screencopy.zig");
+const encoder = @import("encoder.zig");
 
 pub const Config = struct {
     output_path: []const u8,
     framerate: u32,
     video_bitrate_kbps: u32,
+    region: ?encoder.Region = null,
 };
 
 pub const Backend = struct {
@@ -27,66 +28,28 @@ pub const Backend = struct {
         // Probe one frame to discover dims/format before launching ffmpeg.
         const info = try capture.firstFrameInfo();
         const pix_fmt = screencopy.pixFmtName(info.format);
+
+        const full = encoder.Rect{ .x = 0, .y = 0, .w = info.width & ~@as(u32, 1), .h = info.height & ~@as(u32, 1) };
+        const crop = cropFor(cfg.region, info) orelse full;
         std.log.info(
-            "screencopy: {d}x{d} stride={d} fmt={d} pix_fmt={s}",
-            .{ info.width, info.height, info.stride, info.format, pix_fmt },
+            "screencopy: {d}x{d} stride={d} fmt={d} pix_fmt={s} crop={d}x{d}+{d}+{d}",
+            .{ info.width, info.height, info.stride, info.format, pix_fmt, crop.w, crop.h, crop.x, crop.y },
         );
 
-        const w_str = try std.fmt.allocPrint(allocator, "{d}", .{info.width});
-        defer allocator.free(w_str);
-        const h_str = try std.fmt.allocPrint(allocator, "{d}", .{info.height});
-        defer allocator.free(h_str);
-        const fr_str = try std.fmt.allocPrint(allocator, "{d}", .{cfg.framerate});
-        defer allocator.free(fr_str);
-        const br_str = try std.fmt.allocPrint(allocator, "{d}k", .{cfg.video_bitrate_kbps});
-        defer allocator.free(br_str);
-        const size_str = try std.fmt.allocPrint(allocator, "{s}x{s}", .{ w_str, h_str });
-        defer allocator.free(size_str);
+        // Strides can be wider than width*4; ffmpeg gets the padded width and
+        // the crop trims it.
+        var child = try encoder.spawn(allocator, .{
+            .output_path = cfg.output_path,
+            .framerate = cfg.framerate,
+            .video_bitrate_kbps = cfg.video_bitrate_kbps,
+            .pix_fmt = pix_fmt,
+            .in_w = info.stride / 4,
+            .in_h = info.height,
+            .crop = crop,
+        });
+        errdefer _ = child.kill() catch {};
 
-        // wlr-screencopy can return frames with stride != width * 4 (rare on
-        // niri, but possible). Pad-aware: we tell ffmpeg the stride width.
-        const stride_pixels = info.stride / 4;
-        const stride_w_str = try std.fmt.allocPrint(allocator, "{d}", .{stride_pixels});
-        defer allocator.free(stride_w_str);
-        const stride_size_str = try std.fmt.allocPrint(allocator, "{s}x{s}", .{ stride_w_str, h_str });
-        defer allocator.free(stride_size_str);
-        const crop_str = try std.fmt.allocPrint(
-            allocator,
-            "crop={d}:{d}:0:0",
-            .{ info.width, info.height },
-        );
-        defer allocator.free(crop_str);
-
-        // Fragmented mp4 (+frag_keyframe+empty_moov+default_base_moof) writes a
-        // moov header upfront and a moof per keyframe, so a kill/crash mid-record
-        // leaves a file that's playable up to the last completed fragment. Plain
-        // mp4 would only write moov at finalize → crash = unplayable.
-        const argv = [_][]const u8{
-            "ffmpeg",            "-y",
-            "-f",                "rawvideo",
-            "-pix_fmt",          pix_fmt,
-            "-s",                stride_size_str,
-            "-framerate",        fr_str,
-            "-i",                "-",
-            "-vf",               crop_str,
-            "-c:v",              "libx264",
-            "-preset",           "ultrafast",
-            "-tune",             "zerolatency",
-            "-pix_fmt",          "yuv420p",
-            "-b:v",              br_str,
-            "-movflags",         "+frag_keyframe+empty_moov+default_base_moof",
-            cfg.output_path,
-        };
-
-        var child = std.process.Child.init(&argv, allocator);
-        child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Ignore;
-        child.stderr_behavior = .Inherit;
-        try child.spawn();
-
-        const stdin_file = child.stdin.?;
-
-        const thread = try std.Thread.spawn(.{}, screencopy.captureLoop, .{ capture, stdin_file });
+        const thread = try std.Thread.spawn(.{}, screencopy.captureLoop, .{ capture, child.stdin.? });
 
         return .{
             .allocator = allocator,
@@ -100,12 +63,7 @@ pub const Backend = struct {
         self.capture.stop();
         self.thread.join();
 
-        // Close ffmpeg stdin so it flushes + writes trailer cleanly.
-        if (self.ffmpeg.stdin) |stdin| {
-            stdin.close();
-            self.ffmpeg.stdin = null;
-        }
-        _ = self.ffmpeg.wait() catch {};
+        encoder.finish(&self.ffmpeg);
     }
 
     pub fn setPaused(self: *Backend, p: bool) void {
@@ -121,3 +79,27 @@ pub const Backend = struct {
         self.allocator.destroy(self.capture);
     }
 };
+
+/// wlr-screencopy records the first wl_output, which GDK lists as monitor 0.
+fn cropFor(region: ?encoder.Region, info: screencopy.Frame) ?encoder.Rect {
+    const r = region orelse return null;
+    if (r.monitor_index != 0) {
+        std.log.warn("selected area is not on the first monitor; recording full output", .{});
+        return null;
+    }
+    return encoder.regionToCrop(r, r.mon_x, r.mon_y, r.mon_w, r.mon_h, info.width, info.height);
+}
+
+/// One frame of the first output, for the area picker background.
+pub fn grabStill(allocator: std.mem.Allocator) !encoder.Still {
+    var capture = try screencopy.Capture.init(allocator, 30);
+    defer capture.deinit();
+    const info = try capture.firstFrameInfo();
+    switch (info.format) {
+        screencopy.format_xrgb8888, screencopy.format_argb8888 => {},
+        else => return error.UnsupportedFormat,
+    }
+    const len = @as(usize, info.stride) * info.height;
+    const data = try allocator.dupe(u8, capture.state.shm_ptr.?[0..len]);
+    return .{ .data = data, .width = info.width, .height = info.height, .stride = info.stride, .allocator = allocator };
+}
