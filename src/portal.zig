@@ -42,8 +42,34 @@ pub const Session = struct {
     pw_fd: c_int,
     stream: Stream,
     allocator: std.mem.Allocator,
+    closed: *std.atomic.Value(bool),
+    closed_sub: c.guint = 0,
+
+    /// Flags the session as closed when the compositor ends it (e.g. Stop in
+    /// the GNOME panel's screen-sharing indicator). The signal is dispatched
+    /// on the global main context, so call this from a thread without a
+    /// thread-default context while the GTK main loop runs.
+    pub fn watchClosed(self: *Session) void {
+        self.closed_sub = c.g_dbus_connection_signal_subscribe(
+            self.conn,
+            bus_name,
+            "org.freedesktop.portal.Session",
+            "Closed",
+            self.handle.ptr,
+            null,
+            c.G_DBUS_SIGNAL_FLAGS_NONE,
+            onSessionClosed,
+            self.closed,
+            null,
+        );
+    }
+
+    pub fn isClosed(self: *const Session) bool {
+        return self.closed.load(.acquire);
+    }
 
     pub fn close(self: *Session) void {
+        if (self.closed_sub != 0) c.g_dbus_connection_signal_unsubscribe(self.conn, self.closed_sub);
         var err: ?*c.GError = null;
         const ret = c.g_dbus_connection_call_sync(
             self.conn,
@@ -61,9 +87,23 @@ pub const Session = struct {
         if (ret) |r| c.g_variant_unref(r);
         if (err) |e| c.g_error_free(e);
         self.allocator.free(self.handle);
+        self.allocator.destroy(self.closed);
         c.g_object_unref(self.conn);
     }
 };
+
+fn onSessionClosed(
+    _: ?*c.GDBusConnection,
+    _: [*c]const u8,
+    _: [*c]const u8,
+    _: [*c]const u8,
+    _: [*c]const u8,
+    _: ?*c.GVariant,
+    user: c.gpointer,
+) callconv(.c) void {
+    const flag: *std.atomic.Value(bool) = @ptrCast(@alignCast(user));
+    flag.store(true, .release);
+}
 
 pub const Options = struct {
     /// Only offer monitors (needed when cropping to a drawn area).
@@ -162,8 +202,11 @@ pub fn open(allocator: std.mem.Allocator, opts: Options) Error!Session {
     }
 
     const fd = try p.openPipeWireRemote();
+    const closed = allocator.create(std.atomic.Value(bool)) catch return Error.OutOfMemory;
+    closed.* = std.atomic.Value(bool).init(false);
 
     return .{
+        .closed = closed,
         .conn = conn,
         .handle = p.session.?,
         .pw_fd = fd,
@@ -172,15 +215,18 @@ pub fn open(allocator: std.mem.Allocator, opts: Options) Error!Session {
     };
 }
 
-var app_id_registered = false;
+var registered_conn: ?*c.GDBusConnection = null;
 
 /// Host apps get their portal app id from the launcher's systemd scope, so a
 /// hotkey launch and a terminal launch look like different apps and the
 /// restore token is rejected. Registering a fixed id keeps it stable.
-/// Must precede any other portal call on the connection.
+/// Must precede any other portal call on the connection, and applies to that
+/// connection only: an extra ref keeps the shared bus connection alive so
+/// later sessions reuse it instead of getting an unregistered one.
 fn registerAppId(conn: *c.GDBusConnection) void {
-    if (app_id_registered) return;
-    app_id_registered = true;
+    if (registered_conn == conn) return;
+    if (registered_conn) |old| c.g_object_unref(old);
+    registered_conn = @ptrCast(c.g_object_ref(conn));
     var args = [_]*c.GVariant{ c.g_variant_new_string("one-cap").?, dict(&.{}) };
     var err: ?*c.GError = null;
     const ret = c.g_dbus_connection_call_sync(

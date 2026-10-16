@@ -19,6 +19,9 @@ pub const Options = struct {
     sample_rate: u32 = 48000,
     channels: u8 = 2,
     show_ui: bool = true,
+    /// Show the GTK control bar while recording. Off by default: on Wayland
+    /// the bar can't be positioned, so it would land inside the recording.
+    show_bar: bool = false,
     /// GUI mode: show the drag-to-select overlay before the control bar.
     select_area: bool = true,
     region: ?encoder.Region = null,
@@ -155,8 +158,8 @@ fn recordWithUi(allocator: std.mem.Allocator, opts_in: Options) !void {
     };
     const starter = try std.Thread.spawn(.{}, lazyStarterThread, .{&rt});
 
-    ui.run(&state) catch |e| {
-        std.log.err("ui error: {} — stopping", .{e});
+    (if (opts.show_bar) ui.run(&state) else ui.runHidden(&state)) catch |e| {
+        std.log.err("ui error: {t} — stopping", .{e});
         state.requestStop();
     };
     state.requestStop();
@@ -167,9 +170,16 @@ fn recordWithUi(allocator: std.mem.Allocator, opts_in: Options) !void {
         return;
     }
 
-    const final_speed_x100 = state.speedX100();
-
+    const elapsed_s = ui.elapsedRecordingSeconds(&state);
     shutdownRuntime(&rt);
+
+    // No-bar mode: capture is already stopped, so the dialog can't end up in
+    // the video. Pick speed, then save or discard.
+    if (!opts.show_bar and !ui.runFinish(&state, elapsed_s)) {
+        std.log.info("recording discarded", .{});
+        return;
+    }
+    const final_speed_x100 = state.speedX100();
 
     var mux_ctx = MuxCtx{
         .allocator = allocator,
@@ -226,6 +236,7 @@ fn lazyStarterThread(rt: *RuntimeCtx) void {
     bringUpRuntime(rt) catch |e| {
         std.log.err("startup failed: {t} — aborting", .{e});
         rt.state.requestStop();
+        ui.closeFromOtherThread();
         return;
     };
     rt.started = true;
@@ -331,6 +342,12 @@ fn controllerLoop(
     var last_mic = false;
     var last_cursor = true;
     while (!state.stop_requested.load(.acquire)) {
+        if (screen_rec.ended()) {
+            std.log.info("screen share ended — stopping", .{});
+            state.requestStop();
+            ui.closeFromOtherThread();
+            break;
+        }
         const now_paused = state.isPaused();
         if (now_paused != last_paused) {
             // Global pause: drop samples on both tracks so audio shrinks with the

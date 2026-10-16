@@ -52,7 +52,12 @@ On start a dimmed overlay appears: drag a rectangle (redraw to adjust),
 **Space** starts recording that area, or the full screen if nothing is drawn.
 **Esc** cancels. `--full` skips the picker.
 
-Mini bar: timer • 🖱 cursor (wlroots only) • speed • 🎤 mic • ⏸ pause • ⏹ stop.
+No control bar while recording (Wayland can't place it outside the video).
+Stop with `SIGTERM` (e.g. a toggle hotkey running `pkill -x one-cap`), or on
+GNOME via the panel's screen-sharing indicator → *Stop*. Capture stops first,
+then a small dialog picks the playback speed (1× / 1.25× / 1.5× / 2×, keys
+1–4) and saves (Enter, close, or the stop hotkey again) or discards.
+`--bar` shows the old live bar instead: timer • speed • 🎤 mic • ⏸ pause • ⏹ stop.
 
 On GNOME the share dialog appears once; the grant is remembered in
 `~/.config/one-cap/portal-restore-token` (delete it to pick another monitor).

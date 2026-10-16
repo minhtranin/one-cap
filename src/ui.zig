@@ -121,14 +121,40 @@ fn onStopSignal(_: c.gpointer) callconv(.c) c.gboolean {
     if (overlay_active) {
         finishOverlay(.cancelled);
     } else {
-        if (widgets_global) |w| w.state.requestStop();
+        if (active_state) |st| st.requestStop();
         c.gtk_main_quit();
+    }
+    return 1;
+}
+
+var active_state: ?*State = null;
+
+/// Recording without a control bar, so nothing extra lands in the video.
+/// Stops on SIGTERM/SIGINT (hotkey toggle), the duration limit, or when the
+/// recorder calls closeFromOtherThread (e.g. the share was ended from the
+/// GNOME panel).
+pub fn runHidden(state: *State) !void {
+    try initGtk();
+    active_state = state;
+    defer active_state = null;
+    if (state.duration_seconds > 0) _ = c.g_timeout_add(200, @ptrCast(&onHiddenTick), null);
+    c.gtk_main();
+}
+
+fn onHiddenTick(_: c.gpointer) callconv(.c) c.gboolean {
+    const st = active_state orelse return 0;
+    if (st.isStarted() and elapsedRecordingSeconds(st) >= st.duration_seconds) {
+        st.requestStop();
+        c.gtk_main_quit();
+        return 0;
     }
     return 1;
 }
 
 pub fn run(state: *State) !void {
     try initGtk();
+    active_state = state;
+    defer active_state = null;
 
     const css =
         \\button { padding: 2px 6px; min-height: 0px; min-width: 0px; font-size: 14px; }
@@ -239,6 +265,123 @@ fn quitMainIdle(_: c.gpointer) callconv(.c) c.gboolean {
 
 var finalize_done = std.atomic.Value(bool).init(false);
 var finalize_win: ?*c.GtkWidget = null;
+
+// --- stop dialog (no-bar mode) ---
+
+const speed_choices = [_]struct { label: [*:0]const u8, x100: u32 }{
+    .{ .label = "1×", .x100 = 100 },
+    .{ .label = "1.25×", .x100 = 125 },
+    .{ .label = "1.5×", .x100 = 150 },
+    .{ .label = "2×", .x100 = 200 },
+};
+
+var finish_save = true;
+var finish_state: ?*State = null;
+var finish_win: ?*c.GtkWidget = null;
+
+/// Shown after capture stopped: pick the playback speed, then Save (Enter,
+/// window close, or the stop hotkey again) or Discard. Returns false only for
+/// an explicit Discard.
+pub fn runFinish(state: *State, elapsed_s: u64) bool {
+    initGtk() catch return true;
+    finish_save = true;
+    finish_state = state;
+    active_state = null;
+    defer finish_state = null;
+
+    const win = c.gtk_window_new(c.GTK_WINDOW_TOPLEVEL) orelse return true;
+    finish_win = win;
+    c.gtk_window_set_title(@ptrCast(win), "one-cap");
+    c.gtk_window_set_keep_above(@ptrCast(win), 1);
+    c.gtk_window_set_resizable(@ptrCast(win), 0);
+    c.gtk_window_set_decorated(@ptrCast(win), 0);
+    c.gtk_window_set_skip_taskbar_hint(@ptrCast(win), 1);
+    c.gtk_window_set_position(@ptrCast(win), c.GTK_WIN_POS_CENTER);
+
+    const vbox = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 10);
+    c.gtk_widget_set_margin_top(vbox, 12);
+    c.gtk_widget_set_margin_bottom(vbox, 12);
+    c.gtk_widget_set_margin_start(vbox, 14);
+    c.gtk_widget_set_margin_end(vbox, 14);
+    c.gtk_container_add(@ptrCast(win), vbox);
+
+    var buf: [128]u8 = undefined;
+    const title = std.fmt.bufPrintZ(&buf, "<b>Recording stopped</b>  <span foreground='#999'>{d:0>2}:{d:0>2}</span>", .{ elapsed_s / 60, elapsed_s % 60 }) catch "";
+    const lbl = c.gtk_label_new(null);
+    c.gtk_label_set_markup(@ptrCast(lbl), title.ptr);
+    c.gtk_label_set_xalign(@ptrCast(lbl), 0);
+    c.gtk_box_pack_start(@ptrCast(vbox), lbl, 0, 0, 0);
+
+    const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
+    c.gtk_box_pack_start(@ptrCast(vbox), row, 0, 0, 0);
+
+    var group: ?*c.GSList = null;
+    for (speed_choices, 0..) |choice, i| {
+        const rb = c.gtk_radio_button_new_with_label(group, choice.label);
+        group = c.gtk_radio_button_get_group(@ptrCast(rb));
+        c.gtk_toggle_button_set_mode(@ptrCast(rb), 0);
+        if (choice.x100 == state.speedX100()) c.gtk_toggle_button_set_active(@ptrCast(rb), 1);
+        _ = c.g_signal_connect_data(rb, "toggled", @ptrCast(&onFinishSpeed), @ptrFromInt(i + 1), null, 0);
+        c.gtk_box_pack_start(@ptrCast(row), rb, 0, 0, 0);
+    }
+
+    const save_btn = c.gtk_button_new_with_label("Save");
+    const discard_btn = c.gtk_button_new_with_label("Discard");
+    c.gtk_style_context_add_class(c.gtk_widget_get_style_context(save_btn), "suggested-action");
+    c.gtk_box_pack_end(@ptrCast(row), save_btn, 0, 0, 0);
+    c.gtk_box_pack_end(@ptrCast(row), discard_btn, 0, 0, 12);
+    _ = c.g_signal_connect_data(save_btn, "clicked", @ptrCast(&onFinishSave), null, null, 0);
+    _ = c.g_signal_connect_data(discard_btn, "clicked", @ptrCast(&onFinishDiscard), null, null, 0);
+    _ = c.g_signal_connect_data(win, "key-press-event", @ptrCast(&onFinishKey), null, null, 0);
+    _ = c.g_signal_connect_data(win, "delete-event", @ptrCast(&onFinishDelete), null, null, 0);
+
+    c.gtk_widget_show_all(win);
+    c.gtk_widget_grab_focus(save_btn);
+    c.gtk_main();
+
+    if (finish_win) |w| c.gtk_widget_destroy(w);
+    finish_win = null;
+    return finish_save;
+}
+
+fn onFinishSpeed(btn: *c.GtkToggleButton, user: c.gpointer) callconv(.c) void {
+    if (c.gtk_toggle_button_get_active(btn) == 0) return;
+    const st = finish_state orelse return;
+    st.setSpeedX100(speed_choices[@intFromPtr(user) - 1].x100);
+}
+
+fn onFinishSave(_: *c.GtkButton, _: c.gpointer) callconv(.c) void {
+    finish_save = true;
+    c.gtk_main_quit();
+}
+
+fn onFinishDiscard(_: *c.GtkButton, _: c.gpointer) callconv(.c) void {
+    finish_save = false;
+    c.gtk_main_quit();
+}
+
+fn onFinishKey(_: *c.GtkWidget, ev: *const EventKey, _: c.gpointer) callconv(.c) c.gboolean {
+    const st = finish_state orelse return 0;
+    switch (ev.keyval) {
+        c.GDK_KEY_Return, c.GDK_KEY_KP_Enter, c.GDK_KEY_Escape => {
+            finish_save = true;
+            c.gtk_main_quit();
+        },
+        c.GDK_KEY_1, c.GDK_KEY_2, c.GDK_KEY_3, c.GDK_KEY_4 => {
+            st.setSpeedX100(speed_choices[ev.keyval - c.GDK_KEY_1].x100);
+            finish_save = true;
+            c.gtk_main_quit();
+        },
+        else => return 0,
+    }
+    return 1;
+}
+
+fn onFinishDelete(_: *c.GtkWidget, _: ?*anyopaque, _: c.gpointer) callconv(.c) c.gboolean {
+    finish_save = true;
+    c.gtk_main_quit();
+    return 1;
+}
 
 /// Show small floating "Finalizing..." dialog and enter GTK main loop. Returns
 /// when `signalFinalizeDone()` is called from another thread. Caller must call
@@ -382,7 +525,7 @@ fn onTick(_: c.gpointer) callconv(.c) c.gboolean {
 
 /// Wall-clock recording time minus total paused time. Used by the label
 /// and duration enforcement. Returns 0 if recording hasn't started yet.
-fn elapsedRecordingSeconds(state: *State) u64 {
+pub fn elapsedRecordingSeconds(state: *State) u64 {
     const start = state.recording_start_ns.load(.acquire);
     if (start == 0) return 0;
     const now: i64 = @intCast(std.time.nanoTimestamp());

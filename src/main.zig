@@ -25,6 +25,7 @@ const usage =
     \\        --mic               Capture microphone instead of system audio
     \\        --monitor           Capture system audio (default — explicit override)
     \\        --full              Skip the area picker, record the whole screen
+    \\        --bar               Show the control bar (pause / mic / speed) while recording
     \\    -h, --help              Print this help
     \\
     \\EXAMPLES:
@@ -88,6 +89,8 @@ pub fn main() !void {
             opts.audio_source = .microphone;
         } else if (std.mem.eql(u8, a, "--full")) {
             opts.select_area = false;
+        } else if (std.mem.eql(u8, a, "--bar")) {
+            opts.show_bar = true;
         } else if (std.mem.eql(u8, a, "--no-ui")) {
             opts.show_ui = false;
         } else if (a.len > 0 and a[0] == '-') {

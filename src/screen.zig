@@ -142,6 +142,15 @@ pub const Recorder = struct {
         }
     }
 
+    /// True once the capture source went away (e.g. sharing stopped from the
+    /// GNOME panel indicator).
+    pub fn ended(self: *Recorder) bool {
+        return switch (self.impl) {
+            .portal => |*pb| pb.ended(),
+            else => false,
+        };
+    }
+
     pub fn backendUsed(self: Recorder) Backend {
         return self.backend;
     }

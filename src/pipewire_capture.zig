@@ -140,6 +140,20 @@ pub const Capture = struct {
         self.crop = rect;
     }
 
+    /// Blocks until the first frame was copied (GNOME only sends frames on
+    /// damage, so this can lag). Callers start audio afterwards to stay in sync.
+    pub fn waitFirstFrame(self: *Capture, timeout_ns: u64) bool {
+        var timer = std.time.Timer.start() catch return false;
+        while (timer.read() < timeout_ns) {
+            self.mutex.lock();
+            const ready = self.has_frame or self.stream_error;
+            self.mutex.unlock();
+            if (ready) return self.has_frame;
+            std.Thread.sleep(2 * std.time.ns_per_ms);
+        }
+        return false;
+    }
+
     pub fn setPaused(self: *Capture, p: bool) void {
         self.paused.store(p, .release);
     }

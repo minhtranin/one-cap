@@ -16,7 +16,7 @@ main.zig
        │    └─ wf-recorder subprocess  (wlroots cli fallback)
        │    └─ ffmpeg x11grab/kmsgrab  (X11 / DRM fallback)
        ├─ audio.zig    ── native libpulse, raw PCM s16le to file
-       └─ ui.zig       ── area-select overlay + GTK3 mini bar
+       └─ ui.zig       ── area-select overlay, stop dialog, optional mini bar
 ```
 
 **Audio**: native Zig + libpulse, writes PCM bytes to `/tmp/one-cap-audio.raw`.
@@ -81,6 +81,14 @@ wayland-scanner private-code  /usr/share/wlr-protocols/unstable/wlr-screencopy-u
 - GNOME portal: restore token in `~/.config/one-cap/portal-restore-token`
   (share dialog once). `host.portal.Registry.Register("one-cap")` runs first
   so hotkey vs terminal launches share the same app id / grant.
+- App id registration is per D-Bus connection. `registerAppId` keeps a ref
+  on the shared bus connection; without it the connection dies after the
+  first session (still frame) and the recording session comes in as app id
+  `''` → grant rejected → share dialog every time.
+- Default GUI mode has no bar while recording (Wayland can't place it outside
+  the video). Stop = SIGTERM/SIGINT (`g_unix_signal_add`) or portal
+  `Session.Closed`; capture stops, then `ui.runFinish` picks speed/save.
+  `--bar` keeps the live bar.
 - Mutter only sends frames on damage → writer thread repeats the latest frame
   at fixed fps into ffmpeg. Crop happens while copying.
 - `build.zig` sets `use_lld = true` because gcc 16's `crt1.o` carries an

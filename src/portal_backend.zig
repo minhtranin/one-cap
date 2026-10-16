@@ -23,6 +23,7 @@ pub const Backend = struct {
     pub fn start(allocator: std.mem.Allocator, cfg: Config) !Backend {
         var session = try portal.open(allocator, .{ .monitor_only = true });
         errdefer session.close();
+        session.watchClosed();
         const st = session.stream;
 
         const capture = try pw.Capture.create(allocator, session.pw_fd, st.node_id, cfg.framerate);
@@ -40,6 +41,7 @@ pub const Backend = struct {
             st.node_id, fmt.width, fmt.height, pix_fmt, crop.w, crop.h, crop.x, crop.y,
         });
         try capture.setCrop(crop);
+        if (!capture.waitFirstFrame(3 * std.time.ns_per_s)) std.log.warn("portal: no frame within 3s", .{});
 
         var child = try encoder.spawn(allocator, .{
             .output_path = cfg.output_path,
@@ -71,6 +73,13 @@ pub const Backend = struct {
 
     pub fn setPaused(self: *Backend, p: bool) void {
         self.capture.setPaused(p);
+    }
+
+    pub fn ended(self: *Backend) bool {
+        if (self.session.isClosed()) return true;
+        self.capture.mutex.lock();
+        defer self.capture.mutex.unlock();
+        return self.capture.stream_error;
     }
 
     pub fn deinit(self: *Backend) void {
