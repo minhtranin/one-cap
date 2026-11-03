@@ -26,8 +26,9 @@ main.zig
 shm buffers, pipes raw pixels to `ffmpeg` (spawned subprocess) which encodes
 to H264/MKV on stdin. No Python, no GStreamer.
 
-**Mux**: one `ffmpeg` call — stream-copy video, encode PCM → AAC (mkv/mp4)
-or Opus (webm).
+**Mux**: one `ffmpeg` call — re-encode video (x264 veryfast CRF 18, 2 s
+keyframes, faststart for mp4) since capture is ultrafast at ~40 Mbps; encode
+PCM → AAC (mkv/mp4) or Opus (webm, video stream-copied).
 
 ## Container / encoder matrix
 

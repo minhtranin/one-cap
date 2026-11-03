@@ -381,6 +381,23 @@ fn controllerLoop(
     }
 }
 
+/// Capture encodes with x264 ultrafast at a high bitrate so it never drops
+/// frames; re-encoding once on save makes the file ~10x smaller with no visible
+/// loss, and faststart + 2 s keyframes let players start and seek right away.
+fn appendVideoEncode(argv: *std.array_list.Managed([]const u8), output_path: []const u8) !void {
+    if (std.mem.endsWith(u8, output_path, ".webm")) return argv.appendSlice(&.{ "-c:v", "copy" });
+    try argv.appendSlice(&.{
+        "-c:v",              "libx264",
+        "-preset",           "veryfast",
+        "-crf",              "18",
+        "-profile:v",        "high",
+        "-pix_fmt",          "yuv420p",
+        "-force_key_frames", "expr:gte(t,n_forced*2)",
+    });
+    if (std.mem.endsWith(u8, output_path, ".mp4") or std.mem.endsWith(u8, output_path, ".mov"))
+        try argv.appendSlice(&.{ "-movflags", "+faststart" });
+}
+
 fn mux(
     allocator: std.mem.Allocator,
     video_path: []const u8,
@@ -400,10 +417,8 @@ fn mux(
         "aac";
 
     const speed_active = speed_x100 != 100;
-    // Speed-up path uses `-itsscale 1/N` to rewrite input PTS in-place on the
-    // video container, then stream-copies the video bytes (no re-encode → no
-    // quality loss and finalize stays in seconds even for hour-long captures).
-    // Audio is sped via `atempo` which still requires re-encoding (cheap on raw
+    // Speed-up path uses `-itsscale 1/N` to rewrite input PTS on the video
+    // input, so no frame-dropping filter is needed. Audio is sped via `atempo` which still requires re-encoding (cheap on raw
     // PCM input) — without atempo the audio would shift pitch like a chipmunk.
     const speed_n: f64 = @as(f64, @floatFromInt(speed_x100)) / 100.0;
     const itsscale: f64 = 1.0 / speed_n;
@@ -447,11 +462,12 @@ fn mux(
             "-filter_complex", filter,
             "-map",            "0:v",
             "-map",            "[aout]",
-            "-c:v",            "copy",
-            "-c:a",            audio_codec,
-            "-b:a",            "192k",
-            "-shortest",
-            opts.output_path,
+        });
+        try appendVideoEncode(&argv, opts.output_path);
+        try argv.appendSlice(&.{
+            "-c:a",      audio_codec,
+            "-b:a",      "192k",
+            "-shortest", opts.output_path,
         });
 
         var child = std.process.Child.init(argv.items, allocator);
@@ -473,19 +489,20 @@ fn mux(
         try argv.appendSlice(&.{
             "-filter_complex",
             "[1:a][2:a]amix=inputs=2:duration=longest:dropout_transition=0[aout]",
-            "-map",      "0:v",
-            "-map",      "[aout]",
+            "-map",
+            "0:v",
+            "-map",
+            "[aout]",
         });
     } else {
         try argv.appendSlice(&.{ "-map", "0:v", "-map", "1:a" });
     }
 
+    try appendVideoEncode(&argv, opts.output_path);
     try argv.appendSlice(&.{
-        "-c:v", "copy",
-        "-c:a", audio_codec,
-        "-b:a", "192k",
-        "-shortest",
-        opts.output_path,
+        "-c:a",      audio_codec,
+        "-b:a",      "192k",
+        "-shortest", opts.output_path,
     });
 
     var child = std.process.Child.init(argv.items, allocator);
