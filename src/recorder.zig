@@ -245,6 +245,10 @@ fn lazyStarterThread(rt: *RuntimeCtx) void {
 }
 
 fn bringUpRuntime(rt: *RuntimeCtx) !void {
+    // GNOME animates the area picker away after it's destroyed; capturing
+    // right away puts the dimmed overlay in the first frames (and thumbnail).
+    if (rt.opts.select_area) std.Thread.sleep(500 * std.time.ns_per_ms);
+
     std.fs.cwd().deleteFile(rt.tmp_audio) catch {};
     std.fs.cwd().deleteFile(rt.tmp_mic) catch {};
 
@@ -268,7 +272,9 @@ fn bringUpRuntime(rt: *RuntimeCtx) !void {
     rt.audio_file = try std.fs.cwd().createFile(rt.tmp_audio, .{});
     rt.audio_thread = try std.Thread.spawn(.{}, audio.captureLoop, .{ &rt.audio_cap.?, rt.audio_file.? });
 
-    const want_mic_track = rt.opts.audio_source == .monitor;
+    // The mic track is only reachable from the bar's toggle. Opening a
+    // Bluetooth headset mic flips it to HFP, which pauses playing media.
+    const want_mic_track = rt.opts.audio_source == .monitor and rt.opts.show_bar;
     if (want_mic_track) {
         var mc = try audio.Capture.init(.{
             .sample_rate = rt.opts.sample_rate,
